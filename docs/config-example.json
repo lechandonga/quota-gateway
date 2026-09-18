@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "defaultWeight": 1,
+  "degrade": "deny",
+  "globalMaxConcurrent": 100,
+  "rules": [
+    {
+      "tenant": "team-alpha",
+      "api": "/v1/chat/completions",
+      "rate": 20,
+      "burst": 40,
+      "maxConcurrent": 30,
+      "weight": 4
+    },
+    {
+      "tenant": "team-alpha",
+      "rate": 50,
+      "burst": 100,
+      "maxConcurrent": 60,
+      "weight": 4
+    },
+    {
+      "tenant": "team-beta",
+      "api": "/v1/chat/completions",
+      "rate": 5,
+      "burst": 10,
+      "maxConcurrent": 10,
+      "weight": 1
+    },
+    {
+      "tenant": "team-beta",
+      "rate": 10,
+      "burst": 20,
+      "maxConcurrent": 20,
+      "weight": 1
+    }
+  ]
+}
