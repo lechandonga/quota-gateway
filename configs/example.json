@@ -1,0 +1,25 @@
+{
+  "apiVersion": "v1",
+  "version": 1,
+  "mode": "distributed",
+  "degrade": "fail-open",
+  "sessionTtlMillis": 30000,
+  "heartbeatMillis": 5000,
+  "requestTimeoutMillis": 2000,
+  "tenants": {
+    "team-alpha": {
+      "/v1/chat": { "ratePerSec": 20, "burst": 40, "maxConcurrent": 10, "weight": 1 },
+      "/v1/embed": { "ratePerSec": 100, "burst": 200, "maxConcurrent": 50, "weight": 1 }
+    },
+    "team-beta": {
+      "/v1/chat": { "ratePerSec": 60, "burst": 120, "maxConcurrent": 30, "weight": 3 }
+    }
+  },
+  "groups": {
+    "llm-pool": { "name": "llm-pool", "capacity": 40, "defaultWeight": 1 }
+  },
+  "tenantGroups": {
+    "team-alpha": { "/v1/chat": "llm-pool" },
+    "team-beta": { "/v1/chat": "llm-pool" }
+  }
+}
