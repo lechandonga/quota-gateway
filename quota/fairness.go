@@ -103,37 +103,40 @@ func (s *fairScheduler) acquire(ctx context.Context, tenant string, weight int, 
 			continue
 		}
 
-		// 成为队首：在锁外执行原子判定，避免阻塞其他请求入队/释放。
+		// 成为队首：先出堆（既非纯等待，也尚未准入），在锁外执行原子判定。
+		heap.Pop(&s.queue)
 		s.mu.Unlock()
 		outcome, err := fn()
 		s.mu.Lock()
-		// 等待判定期间自身可能已因 ctx 取消而被标记；以取消优先。
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			s.removeWaiter(w, fs)
+			// 判定期间被取消：该请求不再占位，也不回队。
+			if !w.canceled {
+				w.canceled = true
+				fs.waiting--
+			}
 			s.cond.Broadcast()
 			return ctxErr
 		}
 		switch outcome {
 		case outcomeAdmitted:
-			heap.Pop(&s.queue)
 			fs.waiting--
 			fs.finish = myFinish
 			fs.inflight++
 			s.cond.Broadcast()
 			return nil
 		case outcomeRejected:
-			heap.Pop(&s.queue)
 			fs.waiting--
 			s.cond.Broadcast()
 			return err
 		default: // outcomeContended
 			if err != nil {
-				heap.Pop(&s.queue)
 				fs.waiting--
 				s.cond.Broadcast()
 				return err
 			}
-			s.cond.Wait() // 等待 Release 广播
+			// 未抢到容量：重新入队（F 不变），等待 Release 广播后重试。
+			heap.Push(&s.queue, w)
+			s.cond.Wait()
 		}
 	}
 }
