@@ -13,10 +13,11 @@ import (
 // 版本演进规则：仅新增带 omitempty 的字段；未知字段默认拒绝解析，
 // 避免旧实例误用新语义（调用方可通过 Decoder 自行放宽）。
 type fileConfig struct {
-	Version       string     `json:"version"`
-	DefaultWeight int        `json:"defaultWeight"`
-	Degrade       string     `json:"degrade"`
-	Rules         []fileRule `json:"rules"`
+	Version             string     `json:"version"`
+	DefaultWeight       int        `json:"defaultWeight"`
+	Degrade             string     `json:"degrade"`
+	GlobalMaxConcurrent int64      `json:"globalMaxConcurrent,omitempty"`
+	Rules               []fileRule `json:"rules"`
 }
 
 type fileRule struct {
@@ -48,10 +49,11 @@ func ParseConfig(r io.Reader) (*Config, error) {
 		return nil, newConfigError("degrade", err.Error())
 	}
 	cfg := &Config{
-		Version:       fc.Version,
-		DefaultWeight: fc.DefaultWeight,
-		Degrade:       dp,
-		Rules:         make([]Rule, 0, len(fc.Rules)),
+		Version:             fc.Version,
+		DefaultWeight:       fc.DefaultWeight,
+		Degrade:             dp,
+		GlobalMaxConcurrent: fc.GlobalMaxConcurrent,
+		Rules:               make([]Rule, 0, len(fc.Rules)),
 	}
 	for _, fr := range fc.Rules {
 		cfg.Rules = append(cfg.Rules, Rule{

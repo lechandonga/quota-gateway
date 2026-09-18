@@ -3,6 +3,8 @@ package quota
 import (
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // DegradePolicy 定义配额后端不可用时的降级策略。
@@ -70,6 +72,9 @@ type Config struct {
 	Rules         []Rule        `json:"rules"`
 	DefaultWeight int           `json:"defaultWeight,omitempty"`
 	Degrade       DegradePolicy `json:"degrade"`
+	// GlobalMaxConcurrent 是所有租户竞争的共享在途容量（0 表示不设全局池）。
+	// 容量竞争时，各租户按 Weight 比例分享该池；闲置容量可被临时借用。
+	GlobalMaxConcurrent int64 `json:"globalMaxConcurrent,omitempty"`
 }
 
 // Validate 校验配置；非法或不兼容的配置返回错误，且不产生任何副作用。
@@ -85,6 +90,9 @@ func Validate(c *Config) error {
 	}
 	if c.DefaultWeight < 0 {
 		return newConfigError("defaultWeight", "must be >= 0")
+	}
+	if c.GlobalMaxConcurrent < 0 {
+		return newConfigError("globalMaxConcurrent", "must be >= 0")
 	}
 	seen := make(map[string]struct{}, len(c.Rules))
 	for i := range c.Rules {
@@ -160,10 +168,11 @@ func (c *Config) Clone() *Config {
 		return nil
 	}
 	cp := &Config{
-		Version:       c.Version,
-		DefaultWeight: c.DefaultWeight,
-		Degrade:       c.Degrade,
-		Rules:         make([]Rule, len(c.Rules)),
+		Version:             c.Version,
+		DefaultWeight:       c.DefaultWeight,
+		Degrade:             c.Degrade,
+		GlobalMaxConcurrent: c.GlobalMaxConcurrent,
+		Rules:               make([]Rule, len(c.Rules)),
 	}
 	copy(cp.Rules, c.Rules)
 	return cp
@@ -185,17 +194,26 @@ func validateVersion(v string) error {
 	return nil
 }
 
-// parseSemVer 解析 "MAJOR.MINOR"（可带 patch 段）。
+// parseSemVer 解析严格的 "MAJOR.MINOR" 或 "MAJOR.MINOR.PATCH"，拒绝尾随内容。
 func parseSemVer(v string) (major, minor int, ok bool) {
-	var patch int
-	n, err := fmt.Sscanf(v, "%d.%d.%d", &major, &minor, &patch)
-	if n >= 2 && err == nil {
-		return major, minor, true
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0, 0, false
 	}
-	// Sscanf 在仅两个数字时返回错误，这里单独处理两段式。
-	major, minor = 0, 0
-	if n2, err2 := fmt.Sscanf(v, "%d.%d", &major, &minor); n2 == 2 && err2 == nil {
-		return major, minor, true
+	for i, p := range parts {
+		if p == "" {
+			return 0, 0, false
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return 0, 0, false
+		}
+		switch i {
+		case 0:
+			major = n
+		case 1:
+			minor = n
+		}
 	}
-	return 0, 0, false
+	return major, minor, true
 }

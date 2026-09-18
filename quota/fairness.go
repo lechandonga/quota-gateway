@@ -3,35 +3,45 @@ package quota
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"math"
 	"sync"
 )
 
-// fairScheduler 是基于加权虚拟完成时间（WFQ/GPS 近似）的本地准入排序器。
+// admitOutcome 是队首准入回调的结果。
+type admitOutcome int
+
+const (
+	outcomeAdmitted  admitOutcome = iota // 已获得容量
+	outcomeContended                     // 共享池暂满：继续等待并重试
+	outcomeRejected                      // 命中速率/租户硬上限：终止排队
+)
+
+// admitFunc 在调用方成为队首时被调用，执行一次原子配额判定。
+type admitFunc func() (admitOutcome, error)
+
+// fairScheduler 是基于加权虚拟完成时间（WFQ/GPS 近似）的准入调度器。
 //
 // 语义：
-//   - 每个请求被视为长度 L=1 的分组，其虚拟完成时间
-//     F = max(flow.finish, V) + L/weight；V 为当前所有忙碌 flow 中
-//     最小的 finish（GPS 虚拟时间的离散近似）。
-//   - 等待中的请求严格按 F 升序放行（F 相同按到达顺序），权重越大的
-//     租户在单位时间内被放行越多，从而按 weight 比例分享可用容量。
-//   - flow 完全闲置（在途与排队均为 0）后再次到达时，基线对齐当前
-//     虚拟时间：闲置容量可被他人借用，原租户恢复请求时既不会被陈旧
-//     的高 finish 长期压制，也不会凭旧的低 finish 插队。
-//
-// 调度器仅决定“准入顺序”，临界区极小，与配额存储实现解耦。
+//   - 请求 F = max(flow.finish, V) + 1/weight；等待请求严格按 (F, seq) 升序
+//     成为队首，权重越大的租户单位时间被放行越多 → 按 weight 比例分享容量。
+//   - 队首通过 admitFunc 原子判定：拿到容量即准入；共享池占满则在队列内
+//     睡眠，由 Release 广播唤醒后重试，因此队列一定可以被排空，不会死锁，
+//     也不会因“只试一次”而错误拒绝可被服务的请求。
+//   - flow 完全闲置后基线对齐当前 V：闲置容量可被他人借用，原租户恢复时
+//     既不被陈旧高 finish 压制，也不凭旧低 finish 插队。
 type fairScheduler struct {
 	mu    sync.Mutex
 	cond  sync.Cond
 	flows map[string]*flowState
-	queue waiterHeap // 所有排队请求，按 (finish, seq) 升序
+	queue waiterHeap
 	seq   int64
 }
 
 type flowState struct {
-	finish   float64 // 该 flow 最近一次准入请求的虚拟完成时间
-	inflight int     // 已准入但未 release 的请求数
-	waiting  int     // 排队中的请求数
+	finish   float64
+	inflight int
+	waiting  int
 }
 
 type waiter struct {
@@ -47,9 +57,11 @@ func newFairScheduler() *fairScheduler {
 	return s
 }
 
-// wait 按 (tenant, weight) 参与公平排队，轮到自己时返回 nil。
-// ctx 取消或超时后请求退出队列（惰性删除），不影响其他请求的排序。
-func (s *fairScheduler) wait(ctx context.Context, tenant string, weight int) error {
+var errWaiterCanceled = errors.New("quota: fair waiter canceled")
+
+// acquire 按 (tenant, weight) 排队，并在成为队首时反复调用 fn 直到：
+// 准入成功（nil）、fn 终止拒绝（返回其 error）、ctx 取消/超时（返回 ctx.Err）。
+func (s *fairScheduler) acquire(ctx context.Context, tenant string, weight int, fn admitFunc) error {
 	if weight < 1 {
 		weight = DefaultWeight
 	}
@@ -67,7 +79,6 @@ func (s *fairScheduler) wait(ctx context.Context, tenant string, weight int) err
 	fs.waiting++
 	s.mu.Unlock()
 
-	// ctx 取消时唤醒全体等待者重新评估，从而完成惰性删除。
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -82,28 +93,61 @@ func (s *fairScheduler) wait(ctx context.Context, tenant string, weight int) err
 	defer s.mu.Unlock()
 	for {
 		if err := ctx.Err(); err != nil {
-			if !w.canceled {
-				w.canceled = true
-				fs.waiting--
-			}
-			s.compactLocked()
+			s.removeWaiter(w, fs)
 			s.cond.Broadcast()
 			return err
 		}
 		s.compactLocked()
-		if s.queue.Len() > 0 && s.queue[0] == w {
+		if s.queue.Len() == 0 || s.queue[0] != w {
+			s.cond.Wait()
+			continue
+		}
+
+		// 成为队首：在锁外执行原子判定，避免阻塞其他请求入队/释放。
+		s.mu.Unlock()
+		outcome, err := fn()
+		s.mu.Lock()
+		// 等待判定期间自身可能已因 ctx 取消而被标记；以取消优先。
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			s.removeWaiter(w, fs)
+			s.cond.Broadcast()
+			return ctxErr
+		}
+		switch outcome {
+		case outcomeAdmitted:
 			heap.Pop(&s.queue)
 			fs.waiting--
 			fs.finish = myFinish
 			fs.inflight++
 			s.cond.Broadcast()
 			return nil
+		case outcomeRejected:
+			heap.Pop(&s.queue)
+			fs.waiting--
+			s.cond.Broadcast()
+			return err
+		default: // outcomeContended
+			if err != nil {
+				heap.Pop(&s.queue)
+				fs.waiting--
+				s.cond.Broadcast()
+				return err
+			}
+			s.cond.Wait() // 等待 Release 广播
 		}
-		s.cond.Wait()
 	}
 }
 
-// release 表示一个已准入请求完成，更新在途计数并唤醒等待者。
+// removeWaiter 惰性/主动移除一个等待者。
+func (s *fairScheduler) removeWaiter(w *waiter, fs *flowState) {
+	if !w.canceled {
+		w.canceled = true
+		fs.waiting--
+	}
+	s.compactLocked()
+}
+
+// release 表示一个已准入请求完成，更新在途计数并广播唤醒队首。
 func (s *fairScheduler) release(tenant string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -115,20 +159,19 @@ func (s *fairScheduler) release(tenant string) {
 		fs.inflight--
 	}
 	if fs.inflight == 0 && fs.waiting == 0 {
-		// 完全闲置：对齐虚拟时间，允许容量被借用，后续请求以当前进度为基线。
 		fs.finish = s.virtualTimeLocked()
 	}
 	s.cond.Broadcast()
 }
 
-// compactLocked 惰性移除堆顶已取消的等待者。
+// compactLocked 移除堆顶已取消的等待者。
 func (s *fairScheduler) compactLocked() {
 	for s.queue.Len() > 0 && s.queue[0].canceled {
 		heap.Pop(&s.queue)
 	}
 }
 
-// virtualTimeLocked 返回当前 GPS 虚拟时间近似：忙碌 flow 中最小 finish。
+// virtualTimeLocked 返回 GPS 虚拟时间近似：忙碌 flow 中最小 finish。
 func (s *fairScheduler) virtualTimeLocked() float64 {
 	v := 0.0
 	first := true

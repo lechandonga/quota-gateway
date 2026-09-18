@@ -18,15 +18,15 @@ type rateState struct {
 }
 
 // MemoryStore 是单实例内存实现，TryAcquire 在单把互斥锁下原子完成
-// “速率令牌扣减 + 并发占位”，语义与 Redis Lua 脚本保持一致。
+// “速率令牌扣减 + 租户并发占位 + 共享容量占位”，语义与 Redis Lua 一致。
 //
-// 并发占位带 TTL：即使持有者所在实例崩溃、未调用 Release，
-// 过期占位也会在后续判定时被惰性回收，不会造成额度泄漏。
+// 并发占位带 TTL：即使持有者所在实例崩溃、未调用 Release，过期占位也会
+// 在后续判定时惰性回收，不会造成额度泄漏。
 type MemoryStore struct {
 	mu   sync.Mutex
 	now  func() time.Time
 	rate map[string]*rateState
-	conc map[string]map[string]time.Time // concKey -> token -> 过期时刻
+	conc map[string]map[string]time.Time // 键 -> token -> 过期时刻
 }
 
 // NewMemoryStore 创建内存存储。
@@ -45,7 +45,7 @@ func (s *MemoryStore) SetNow(f func() time.Time) {
 	s.now = f
 }
 
-func (s *MemoryStore) TryAcquire(ctx context.Context, rateKey, concKey string, rate float64, burst, maxConcurrent int64, token string, ttl time.Duration) (Result, error) {
+func (s *MemoryStore) TryAcquire(ctx context.Context, req AcquireRequest) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
@@ -54,63 +54,72 @@ func (s *MemoryStore) TryAcquire(ctx context.Context, rateKey, concKey string, r
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// ---- 速率判定 ----
-	if rate > 0 {
-		b, ok := s.rate[rateKey]
+	// ---- 1) 速率判定（不通过则立即拒绝，不产生任何占位） ----
+	if req.Rate > 0 {
+		b, ok := s.rate[req.RateKey]
 		if !ok {
-			b = &rateState{rate: rate, capacity: float64(burst), tokens: float64(burst), last: now}
-			s.rate[rateKey] = b
+			b = &rateState{rate: req.Rate, capacity: float64(req.Burst), tokens: float64(req.Burst), last: now}
+			s.rate[req.RateKey] = b
 		}
-		// 配置热更新：新参数即时生效；容量缩小时令牌随之封顶，
-		// 容量放大时不额外补发（仅由时间累积），避免“改配置放大额度”。
-		b.rate = rate
-		b.capacity = float64(burst)
+		// 配置热更新：参数即时生效；容量缩小时令牌封顶，放大时不额外补发，
+		// 避免“改配置放大额度”。
+		b.rate = req.Rate
+		b.capacity = float64(req.Burst)
 		s.refillLocked(b, now)
 		if b.tokens < 1 {
-			retry := time.Duration((1-b.tokens)/rate*float64(time.Second)) + time.Millisecond
+			retry := time.Duration((1-b.tokens)/req.Rate*float64(time.Second)) + time.Millisecond
 			return Result{Status: StatusRateLimited, RetryAfter: retry}, nil
 		}
 	}
 
-	// ---- 并发判定 ----
-	holders := s.conc[concKey]
-	if holders == nil {
-		holders = make(map[string]time.Time)
-		s.conc[concKey] = holders
-	}
-	s.expireLocked(holders, now)
-	if maxConcurrent > 0 && int64(len(holders)) >= maxConcurrent {
-		return Result{Status: StatusConcurrencyLimited, RetryAfter: s.earliestFreeLocked(holders, now)}, nil
+	// ---- 2) 租户并发硬上限（超限立即拒绝，不应排队） ----
+	tenantHolders := s.holdersLocked(req.ConcKey)
+	s.expireLocked(tenantHolders, now)
+	if req.MaxConcurrent > 0 && int64(len(tenantHolders)) >= req.MaxConcurrent {
+		return Result{Status: StatusConcurrencyLimited, RetryAfter: s.earliestFreeLocked(tenantHolders, now)}, nil
 	}
 
-	// ---- 提交：扣令牌 + 占位（同一把锁，原子可见） ----
-	if rate > 0 {
-		b := s.rate[rateKey]
-		b.tokens--
-	}
-	if maxConcurrent > 0 {
-		if ttl > 0 {
-			holders[token] = now.Add(ttl)
-		} else {
-			holders[token] = time.Time{} // 无 TTL：仅靠 Release 释放
+	// ---- 3) 共享容量池（占满时返回可排队状态，供公平调度） ----
+	var sharedHolders map[string]time.Time
+	if req.SharedKey != "" && req.MaxShared > 0 {
+		sharedHolders = s.holdersLocked(req.SharedKey)
+		s.expireLocked(sharedHolders, now)
+		if int64(len(sharedHolders)) >= req.MaxShared {
+			return Result{Status: StatusSharedLimited, RetryAfter: s.earliestFreeLocked(sharedHolders, now)}, nil
 		}
 	}
-	return Result{Status: StatusAcquired, Token: token}, nil
+
+	// ---- 4) 提交：扣令牌 + 两个键同时占位（同一把锁，原子可见） ----
+	if req.Rate > 0 {
+		s.rate[req.RateKey].tokens--
+	}
+	if req.MaxConcurrent > 0 {
+		s.putLocked(tenantHolders, req.Token, now, req.TTL)
+	}
+	if sharedHolders != nil {
+		s.putLocked(sharedHolders, req.Token, now, req.TTL)
+	}
+	return Result{Status: StatusAcquired, Token: req.Token}, nil
 }
 
-func (s *MemoryStore) Release(ctx context.Context, concKey, token string) error {
+func (s *MemoryStore) Release(ctx context.Context, keys []string, token string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	holders := s.conc[concKey]
-	if holders == nil {
-		return nil // 重复/乱序释放：无副作用
-	}
-	delete(holders, token) // 幂等：仅当 token 仍存在时生效
-	if len(holders) == 0 {
-		delete(s.conc, concKey)
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		holders := s.conc[k]
+		if holders == nil {
+			continue // 重复/乱序释放：无副作用
+		}
+		delete(holders, token) // 幂等：仅当 token 仍存在时生效
+		if len(holders) == 0 {
+			delete(s.conc, k)
+		}
 	}
 	return nil
 }
@@ -123,6 +132,27 @@ func (s *MemoryStore) Close() error {
 	s.rate = make(map[string]*rateState)
 	s.conc = make(map[string]map[string]time.Time)
 	return nil
+}
+
+// holdersLocked 返回键对应的占位表（惰性创建）。
+func (s *MemoryStore) holdersLocked(key string) map[string]time.Time {
+	if key == "" {
+		return nil
+	}
+	h := s.conc[key]
+	if h == nil {
+		h = make(map[string]time.Time)
+		s.conc[key] = h
+	}
+	return h
+}
+
+func (s *MemoryStore) putLocked(holders map[string]time.Time, token string, now time.Time, ttl time.Duration) {
+	if ttl > 0 {
+		holders[token] = now.Add(ttl)
+	} else {
+		holders[token] = time.Time{} // 无 TTL：仅靠 Release 释放
+	}
 }
 
 func (s *MemoryStore) refillLocked(b *rateState, now time.Time) {
@@ -162,10 +192,10 @@ func (s *MemoryStore) earliestFreeLocked(holders map[string]time.Time, now time.
 	return d
 }
 
-// inflight 返回某 concKey 的有效占位数（仅用于测试/观测）。
-func (s *MemoryStore) inflight(concKey string) int {
+// inflight 返回某键的有效占位数（仅用于测试/观测）。
+func (s *MemoryStore) inflight(key string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.expireLocked(s.conc[concKey], s.now())
-	return len(s.conc[concKey])
+	s.expireLocked(s.conc[key], s.now())
+	return len(s.conc[key])
 }
