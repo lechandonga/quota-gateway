@@ -199,3 +199,6 @@ func (s *MemoryStore) inflight(key string) int {
 	s.expireLocked(s.conc[key], s.now())
 	return len(s.conc[key])
 }
+
+// Inflight 返回某键当前有效占位数，供测试与运维观测使用。
+func (s *MemoryStore) Inflight(key string) int { return s.inflight(key) }
