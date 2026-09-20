@@ -211,6 +211,8 @@ func (f *fakeRedis) eval(args []string) string {
 		return f.runTryAcquire(keys, argv)
 	case releaseScript:
 		return f.runRelease(keys, argv)
+	case renewScript:
+		return f.runRenew(keys, argv)
 	default:
 		return encErr("ERR unknown script")
 	}
@@ -359,4 +361,29 @@ func (f *fakeRedis) runRelease(keys, argv []string) string {
 		removed = 1
 	}
 	return encInt(int64(removed))
+}
+
+// runRenew 与 renewScript 等价的 Go 实现：仅刷新仍存在的占位。
+func (f *fakeRedis) runRenew(keys, argv []string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ttl, _ := strconv.ParseInt(argv[1], 10, 64)
+	if ttl <= 0 {
+		return encInt(0)
+	}
+	exp := strconv.FormatInt(time.Now().UnixMilli()+ttl, 10)
+	renewed := 0
+	for _, tok := range argv[2:] {
+		for _, key := range keys {
+			h := f.data[key]
+			if h == nil {
+				continue
+			}
+			if _, ok := h[tok]; ok {
+				h[tok] = exp
+				renewed++
+			}
+		}
+	}
+	return encInt(int64(renewed))
 }

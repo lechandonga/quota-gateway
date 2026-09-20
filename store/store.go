@@ -49,6 +49,12 @@ type Store interface {
 	// 重复释放与乱序释放必须无害；速率令牌不归还。
 	Release(ctx context.Context, keys []string, token string) error
 
+	// Renew 批量续租：把 keys 中仍然存在的 tokens 占位的过期时间延长到
+	// 现在+ttl。已过期或已释放的占位不得复活（防止名额被重复计入）。
+	// 用于长连接场景：只要持有方存活就持续续租，崩溃后占位在 TTL 内
+	// 有界回收。
+	Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error
+
 	// Ping 探测后端可用性。
 	Ping(ctx context.Context) error
 

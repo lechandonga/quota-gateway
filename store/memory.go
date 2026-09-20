@@ -124,6 +124,33 @@ func (s *MemoryStore) Release(ctx context.Context, keys []string, token string) 
 	return nil
 }
 
+// Renew 批量延长占位过期时间；仅刷新仍存活（未过期、未释放）的占位，
+// 已过期/不存在的 token 不复活，避免名额被重复计入。
+func (s *MemoryStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ttl <= 0 {
+		return nil // 无 TTL 的占位不过期，无需续租
+	}
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, k := range keys {
+		holders := s.conc[k]
+		if holders == nil {
+			continue
+		}
+		s.expireLocked(holders, now)
+		for _, tok := range tokens {
+			if _, ok := holders[tok]; ok {
+				holders[tok] = now.Add(ttl)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *MemoryStore) Ping(ctx context.Context) error { return ctx.Err() }
 
 func (s *MemoryStore) Close() error {

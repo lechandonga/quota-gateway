@@ -121,6 +121,26 @@ if redis.call('HLEN', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
 return removed
 `
 
+// renewScript 批量续租：仅刷新仍存在的占位（HEXISTS 守卫），
+// 已过期/已释放的占位不复活，防止名额被重复计入。
+// KEYS=占位键列表；ARGV: now_ms ttl_ms token1..tokenN；返回刷新的字段数。
+const renewScript = `
+local now = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+if ttl <= 0 then return 0 end
+local exp = tostring(now + ttl)
+local renewed = 0
+for i = 3, #ARGV do
+  for k = 1, #KEYS do
+    if redis.call('HEXISTS', KEYS[k], ARGV[i]) == 1 then
+      redis.call('HSET', KEYS[k], ARGV[i], exp)
+      renewed = renewed + 1
+    end
+  end
+end
+return renewed
+`
+
 // RedisStore 通过 Redis Lua 脚本实现跨实例原子配额。
 //
 // 多实例语义：所有判定在 Redis 单线程内以单个 Lua 脚本原子执行，
@@ -130,6 +150,7 @@ type RedisStore struct {
 	cl          *redisClient
 	shaTry      string
 	shaRelease  string
+	shaRenew    string
 	scriptMu    sync.Mutex
 	loaded      bool
 	dialTimeout time.Duration
@@ -173,7 +194,15 @@ func (s *RedisStore) ensureScripts(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.shaTry, s.shaRelease, s.loaded = sha1, sha2, true
+	v, err = s.cl.do(ctx, "SCRIPT", "LOAD", renewScript)
+	if err != nil {
+		return err
+	}
+	sha3, err := strReply(v)
+	if err != nil {
+		return err
+	}
+	s.shaTry, s.shaRelease, s.shaRenew, s.loaded = sha1, sha2, sha3, true
 	return nil
 }
 
@@ -247,6 +276,37 @@ func (s *RedisStore) Release(ctx context.Context, keys []string, token string) e
 		}
 	}
 	return nil
+}
+
+// Renew 批量续租：单次 EVAL 完成一组键上多个 token 的过期时间刷新。
+func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+	if len(keys) == 0 || len(tokens) == 0 || ttl <= 0 {
+		return nil
+	}
+	if err := s.ensureScripts(ctx); err != nil {
+		return err
+	}
+	redisKeys := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		redisKeys = append(redisKeys, s.cl.key(k))
+	}
+	if len(redisKeys) == 0 {
+		return nil
+	}
+	args := make([]string, 0, len(tokens)+2)
+	args = append(args,
+		strconv.FormatInt(time.Now().UnixMilli(), 10),
+		strconv.FormatInt(ttl.Milliseconds(), 10),
+	)
+	args = append(args, tokens...)
+	_, err := s.cl.eval(ctx, s.shaRenew, renewScript, redisKeys, args)
+	if err != nil && isNoScript(err) {
+		s.markStale()
+	}
+	return err
 }
 
 func (s *RedisStore) markStale() {

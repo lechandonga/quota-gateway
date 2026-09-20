@@ -172,9 +172,10 @@ type boomStore struct{ err error }
 func (b *boomStore) TryAcquire(context.Context, store.AcquireRequest) (store.Result, error) {
 	return store.Result{}, b.err
 }
-func (b *boomStore) Release(context.Context, []string, string) error { return b.err }
-func (b *boomStore) Ping(context.Context) error                      { return b.err }
-func (b *boomStore) Close() error                                    { return nil }
+func (b *boomStore) Release(context.Context, []string, string) error                { return b.err }
+func (b *boomStore) Renew(context.Context, []string, []string, time.Duration) error { return nil }
+func (b *boomStore) Ping(context.Context) error                                     { return b.err }
+func (b *boomStore) Close() error                                                   { return nil }
 
 func TestMiddleware_DegradeDenyReturns503(t *testing.T) {
 	srv := newServer(t, &boomStore{err: errors.New("redis down")}, testConfig(quota.DegradeDeny),
