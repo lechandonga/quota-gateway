@@ -46,8 +46,11 @@ type errorBody struct {
 //   - 后端不可用且降级策略为 deny → 503 Service Unavailable；
 //   - 请求方 ctx 截止/取消（含客户端断连）不产生占位。
 //
-// 并发占用在以下任一路径都会被幂等释放：handler 正常返回、handler panic、
-// 请求超时、客户端中断（r.Context 被取消）；存储异常路径另有 TTL 兜底。
+// 并发占用的释放不依赖任何每请求 goroutine：Manager 返回的 ReleaseFunc
+// 自身幂等（正常返回 / handler panic / 超时路径的 defer 触发都安全），
+// 且 Manager 后台循环会回收“ctx 已取消但尚未释放”的租约（客户端中断
+// 而 handler 仍未返回的场景），因此任意并发交错下都不会重复归还、
+// 提前归还或泄漏，也不会因释放路径 panic 导致进程退出。
 func QuotaHandler(m *quota.Manager, opts Options) func(http.Handler) http.Handler {
 	resolve := opts.Resolve
 	if resolve == nil {
@@ -68,28 +71,9 @@ func QuotaHandler(m *quota.Manager, opts Options) func(http.Handler) http.Handle
 				return
 			}
 
-			// 任一路径先发生即释放（ReleaseFunc 内部幂等）：
-			// handler 结束 / panic / 超时 / 客户端中断。
-			released := make(chan struct{})
-			doRelease := func() {
-				release()
-				select {
-				case <-released:
-				default:
-					close(released)
-				}
-			}
-			defer doRelease()
-			contextDone := r.Context().Done()
-			if contextDone != nil {
-				go func() {
-					select {
-					case <-contextDone:
-						doRelease()
-					case <-released:
-					}
-				}()
-			}
+			// 幂等释放：handler 正常结束 / panic / 超时由 defer 触发；
+			// 客户端中断但 handler 未返回的场景由 Manager 租约回收兜底。
+			defer release()
 
 			next.ServeHTTP(w, r)
 			if opts.Metrics != nil {
