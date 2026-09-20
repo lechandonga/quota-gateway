@@ -34,16 +34,22 @@ func TestFairScheduler_SerializesByWeightOrder(t *testing.T) {
 	}{{"low", 1}, {"mid", 4}, {"high", 16}, {"low2", 1}}
 	// 每个等待者：成为队首且 holder 仍在途时先 contended；
 	// holder 释放后，每收到一次 step 就放行一个，严格观测 F 顺序。
+	// 注意：调度器允许“前一个队首判定在飞时，下一个等待者成为新队首”，
+	// 因此用 judging 单飞标志让判定串行化，否则两个判定并发阻塞在
+	// step 上时，谁先收到是不确定的（测试本身的竞态，非调度器错误）。
 	step := make(chan struct{})
 	got := make(chan string, 8)
+	var judging atomic.Bool
 	var wg sync.WaitGroup
 	for _, tn := range tenants {
 		wg.Add(1)
 		go func(name string, w int) {
 			defer wg.Done()
-			calls := 0
 			err := s.acquire(ctx, name, w, func() (admitOutcome, error) {
-				calls++
+				if !judging.CompareAndSwap(false, true) {
+					return outcomeContended, nil // 另一判定在飞：重新排队
+				}
+				defer judging.Store(false)
 				select {
 				case <-holderFinish:
 					// holder 已释放：等待主测试逐个放行
