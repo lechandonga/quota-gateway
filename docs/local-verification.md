@@ -22,9 +22,14 @@ CGO_ENABLED=1 go test -race -count=1 ./...
 
 # 仅跑某一场景
 go test -count=1 ./quota/   -run TestAcquire
+go test -count=1 ./quota/   -run TestLease_
+go test -count=1 ./quota/   -run TestDegradeAllow_
 go test -count=1 ./store/   -run TestRedisStore_MultiInstanceConsistency
-go test -count=1 ./store/   -run TestMemoryStore_TTLReclaimsDeadHolders
 go test -count=1 ./middleware/ -run TestMiddleware_LongConnection
+
+# 释放路径并发交错（建议在竞态检测下反复运行）
+CGO_ENABLED=1 go test -race -count=10 ./quota/       -run TestRelease_
+CGO_ENABLED=1 go test -race -count=10 ./middleware/  -run TestMiddleware_ConcurrentDisconnectStorm
 ```
 
 测试覆盖的关键场景：
@@ -34,8 +39,14 @@ go test -count=1 ./middleware/ -run TestMiddleware_LongConnection
 | 突发耗尽、按速率精确恢复、不误伤 | `store.TestMemoryStore_RateBurstAndRecovery`、`quota.TestAcquire_AllowThenRateLimitWithRetryHint`、`..._RateRecoveryServesAgain` |
 | 高并发下额度不放大 | `store.TestMemoryStore_ConcurrentAcquireNoAmplification`、`store.TestRedisStore_MultiInstanceConsistency`（5 实例×60 请求） |
 | 共享池加权公平、可排空、不超发 | `quota.TestFairScheduler_*`、`quota.TestAcquire_SharedPoolDrainsFairly`、`..._WeightsDetermineOrder` |
+| 长连接名额不被提前回收（续租保活，远超 TTL） | `quota.TestLease_LongConnectionKeepsSlotBeyondTTL`、`store.TestMemoryStore_RenewKeepsLongConnectionSlot`、`store.TestRedisStore_RenewSemantics` |
+| 实例崩溃后名额有界回收（含多实例） | `quota.TestLease_CrashRecoversSlotWithinBoundedTime`、`store.TestRedisStore_RenewMultiInstanceCrashRecovery`、`store.TestMemoryStore_TTLReclaimsDeadHolders` |
+| 已释放名额不被续租复活 | `quota.TestLease_ReleasedSlotIsNotResurrected`、`store.TestMemoryStore_RenewDoesNotResurrect` |
+| 断连租约后台有界回收 | `quota.TestLease_CanceledContextReapedInBackground`、`quota.TestDegradeAllow_DisconnectReclaimed` |
+| 释放路径任意并发交错不崩溃、不泄漏（竞态检测） | `quota.TestRelease_ConcurrentInterleavingsNoCrashNoLeak`、`quota.TestRelease_BackendFlakyNoCrashTTLBackstop`、`middleware.TestMiddleware_ConcurrentDisconnectStorm` |
 | 长连接正常/超时/客户端中断释放、重复与乱序释放 | `quota.TestAcquire_LongConnectionReleasePaths`、`middleware.TestMiddleware_LongConnectionReleasesOnClientInterrupt` |
-| 实例崩溃占位 TTL 回收 | `store.TestMemoryStore_TTLReclaimsDeadHolders` |
+| 降级放行的本地硬上限、恢复后不放大不重复计数 | `quota.TestDegradeAllow_LocalHardCapEnforced`、`..._RecoveryNoAmplificationNoDoubleCount` |
+| 长连接期间的热更新（不误回收/不重复占用、非法配置被拒） | `quota.TestHotUpdate_DuringLongConnection`、`..._RemoveRuleKeepsInFlightSafe` |
 | 排队客户端取消不留幽灵占位 | `quota.TestAcquire_ClientCancelWhileQueuedDoesNotLeak` |
 | 配置非法/不兼容被拒绝且保留旧配置 | `quota.TestUpdateConfig_InvalidKeepsOldConfig`、`quota.TestParseConfig_Invalid` |
 | 后端不可用 fail-open / fail-closed | `quota.TestAcquire_DegradeDenyAndAllow`、`middleware.TestMiddleware_Degrade*` |
@@ -58,7 +69,11 @@ go run ./cmd/quota-gateway -addr :8081 -config ./docs/config-example.json -redis
 ```
 
 可选参数：`-degrade` 由配置文件控制；`-reload-interval`（配置轮询，
-`<=0` 表示仅响应 SIGHUP）、`-health-interval`、`-key-prefix`。
+`<=0` 表示仅响应 SIGHUP）、`-health-interval`、`-key-prefix`、
+`-concurrency-ttl`（占位 TTL，崩溃后有界回收）、`-renew-interval`
+（在途续租周期，默认 TTL/3）、`-reap-interval`（断连回收周期，默认
+100ms）、`-queue-timeout`、`-degrade-max-concurrent`（降级放行本地
+硬上限兜底，默认 1024）。均为可选，缺省即有安全默认值。
 
 接口：`/api/echo`、`/api/slow`（~150ms）、`/api/heavy`（~800ms）、
 `/healthz`、`/debug/vars`。租户通过请求头 `X-Tenant-ID` 指定。
