@@ -72,3 +72,40 @@ func TestParseDegradePolicy(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+// 旧配置（无 concurrencyTTLSeconds 字段）继续解析通过，值为 0 表示用默认。
+func TestParseConfig_LegacyWithoutTTLStillWorks(t *testing.T) {
+	raw := `{
+		"version":"1.0",
+		"degrade":"deny",
+		"globalMaxConcurrent":42,
+		"rules":[{"tenant":"a","rate":2,"burst":7,"maxConcurrent":9}]
+	}`
+	cfg, err := ParseConfig(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("legacy config must still parse: %v", err)
+	}
+	if cfg.ConcurrencyTTLSeconds != 0 {
+		t.Fatalf("ttl seconds=%d want 0 (use default)", cfg.ConcurrencyTTLSeconds)
+	}
+}
+
+// 新字段解析与边界校验。
+func TestParseConfig_ConcurrencyTTL(t *testing.T) {
+	cfg, err := ParseConfig(strings.NewReader(
+		`{"version":"1.3","concurrencyTTLSeconds":15,"rules":[]}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.ConcurrencyTTLSeconds != 15 {
+		t.Fatalf("ttl=%d want 15", cfg.ConcurrencyTTLSeconds)
+	}
+	for _, raw := range []string{
+		`{"version":"1.0","concurrencyTTLSeconds":-1}`,
+		`{"version":"1.0","concurrencyTTLSeconds":3601}`,
+	} {
+		if _, err := ParseConfig(strings.NewReader(raw)); err == nil {
+			t.Fatalf("invalid TTL config must be rejected: %s", raw)
+		}
+	}
+}

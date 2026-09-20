@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/lechandonga/quota-gateway/metrics"
@@ -41,13 +42,15 @@ type errorBody struct {
 // QuotaHandler 返回配额中间件。
 //
 // 拒绝语义：
-//   - rate_limited / concurrency_limited → 429 Too Many Requests，
-//     带 Retry-After（秒）与 X-Quota-Reason；
+//   - rate_limited / concurrency_limited / 降级期本地并发上限 → 429 Too Many
+//     Requests，带 Retry-After（秒）与 X-Quota-Reason；
 //   - 后端不可用且降级策略为 deny → 503 Service Unavailable；
 //   - 请求方 ctx 截止/取消（含客户端断连）不产生占位。
 //
 // 并发占用在以下任一路径都会被幂等释放：handler 正常返回、handler panic、
-// 请求超时、客户端中断（r.Context 被取消）；存储异常路径另有 TTL 兜底。
+// 请求超时、客户端中断（r.Context 被取消）；存储异常路径另有租约 TTL 兜底。
+// 释放只执行一次：即使“客户端中断”与“handler 结束”同时发生（高并发压测下
+// 的常见交错），也绝不会重复释放或 panic。
 func QuotaHandler(m *quota.Manager, opts Options) func(http.Handler) http.Handler {
 	resolve := opts.Resolve
 	if resolve == nil {
@@ -68,35 +71,72 @@ func QuotaHandler(m *quota.Manager, opts Options) func(http.Handler) http.Handle
 				return
 			}
 
-			// 任一路径先发生即释放（ReleaseFunc 内部幂等）：
+			// 任一路径先发生即释放（ReleaseFunc 自身也幂等）：
 			// handler 结束 / panic / 超时 / 客户端中断。
-			released := make(chan struct{})
-			doRelease := func() {
-				release()
-				select {
-				case <-released:
-				default:
-					close(released)
-				}
-			}
+			// 必须用 sync.Once：客户端断连的监听 goroutine 与 handler
+			// 返回会并发调用 doRelease，select+close 模式在该交错下会
+			// double-close channel 并使进程 panic。
+			var once sync.Once
+			doRelease := func() { once.Do(release) }
 			defer doRelease()
 			contextDone := r.Context().Done()
 			if contextDone != nil {
+				stop := make(chan struct{})
 				go func() {
 					select {
 					case <-contextDone:
 						doRelease()
-					case <-released:
+					case <-stop:
 					}
 				}()
+				// handler 返回后停止监听；defer 保证 panic 路径也会停止，
+				// goroutine 数量与“进行中的长连接数”同阶，连接结束即退出。
+				defer close(stop)
 			}
 
-			next.ServeHTTP(w, r)
+			// panic 安全兜底：业务 handler 出现运行时异常时，名额由上方
+			// defer 正常归还，客户端得到 500 而不是连接被重置/进程退出。
+			rw := &panicGuardResponseWriter{ResponseWriter: w}
+			defer func() {
+				if rec := recover(); rec != nil {
+					if !rw.wroteHeader {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusInternalServerError)
+						_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+							"code":    string(quota.ErrCodeInternal),
+							"message": "upstream handler panic",
+						}})
+					}
+				}
+			}()
+
+			next.ServeHTTP(rw, r)
 			if opts.Metrics != nil {
 				opts.Metrics.ObserveLatency(tenant, api, time.Since(start))
 			}
 		})
 	}
+}
+
+// panicGuardResponseWriter 记录是否已写响应头，避免 panic 兜底路径重复
+// WriteHeader 产生噪声告警。
+type panicGuardResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (p *panicGuardResponseWriter) WriteHeader(code int) {
+	if !p.wroteHeader {
+		p.wroteHeader = true
+	}
+	p.ResponseWriter.WriteHeader(code)
+}
+
+func (p *panicGuardResponseWriter) Write(b []byte) (int, error) {
+	if !p.wroteHeader {
+		p.wroteHeader = true
+	}
+	return p.ResponseWriter.Write(b)
 }
 
 // writeQuotaError 将 quota.Error 映射为稳定可区分的 HTTP 响应。

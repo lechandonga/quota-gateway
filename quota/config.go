@@ -45,6 +45,9 @@ const (
 	// MinSupportedConfigVersion 是本实例能够兼容的最早配置版本。
 	// 语义化版本：同一主版本号内向前/向后兼容。
 	MinSupportedConfigVersion = "1.0"
+	// maxConcurrencyTTLSeconds 限制租约 TTL 上限（1 小时），防止误配置成
+	// 超大值导致崩溃占位长时间无法回收。
+	maxConcurrencyTTLSeconds = 3600
 )
 
 // Rule 是单个 (租户, 接口) 维度的配额规则。
@@ -75,6 +78,10 @@ type Config struct {
 	// GlobalMaxConcurrent 是所有租户竞争的共享在途容量（0 表示不设全局池）。
 	// 容量竞争时，各租户按 Weight 比例分享该池；闲置容量可被临时借用。
 	GlobalMaxConcurrent int64 `json:"globalMaxConcurrent,omitempty"`
+	// ConcurrencyTTLSeconds 是并发占位租约 TTL（秒，可选）：持有者存活时
+	// 由本实例自动续租，因此长请求不会被提前回收；实例崩溃后遗留占位在
+	// 该时长内有界回收。<=0 表示使用实例默认值（30s）。
+	ConcurrencyTTLSeconds int64 `json:"concurrencyTTLSeconds,omitempty"`
 }
 
 // Validate 校验配置；非法或不兼容的配置返回错误，且不产生任何副作用。
@@ -93,6 +100,12 @@ func Validate(c *Config) error {
 	}
 	if c.GlobalMaxConcurrent < 0 {
 		return newConfigError("globalMaxConcurrent", "must be >= 0")
+	}
+	if c.ConcurrencyTTLSeconds < 0 {
+		return newConfigError("concurrencyTTLSeconds", "must be >= 0")
+	}
+	if c.ConcurrencyTTLSeconds > maxConcurrencyTTLSeconds {
+		return newConfigError("concurrencyTTLSeconds", "must be <= "+itoa(maxConcurrencyTTLSeconds))
 	}
 	seen := make(map[string]struct{}, len(c.Rules))
 	for i := range c.Rules {
@@ -168,11 +181,12 @@ func (c *Config) Clone() *Config {
 		return nil
 	}
 	cp := &Config{
-		Version:             c.Version,
-		DefaultWeight:       c.DefaultWeight,
-		Degrade:             c.Degrade,
-		GlobalMaxConcurrent: c.GlobalMaxConcurrent,
-		Rules:               make([]Rule, len(c.Rules)),
+		Version:               c.Version,
+		DefaultWeight:         c.DefaultWeight,
+		Degrade:               c.Degrade,
+		GlobalMaxConcurrent:   c.GlobalMaxConcurrent,
+		ConcurrencyTTLSeconds: c.ConcurrencyTTLSeconds,
+		Rules:                 make([]Rule, len(c.Rules)),
 	}
 	copy(cp.Rules, c.Rules)
 	return cp

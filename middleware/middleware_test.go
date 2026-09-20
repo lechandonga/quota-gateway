@@ -173,8 +173,14 @@ func (b *boomStore) TryAcquire(context.Context, store.AcquireRequest) (store.Res
 	return store.Result{}, b.err
 }
 func (b *boomStore) Release(context.Context, []string, string) error { return b.err }
-func (b *boomStore) Ping(context.Context) error                      { return b.err }
-func (b *boomStore) Close() error                                    { return nil }
+func (b *boomStore) Renew(context.Context, []string, string, time.Duration) (bool, error) {
+	return false, b.err
+}
+func (b *boomStore) RenewAll(context.Context, []store.RenewItem) ([]string, error) {
+	return nil, b.err
+}
+func (b *boomStore) Ping(context.Context) error { return b.err }
+func (b *boomStore) Close() error               { return nil }
 
 func TestMiddleware_DegradeDenyReturns503(t *testing.T) {
 	srv := newServer(t, &boomStore{err: errors.New("redis down")}, testConfig(quota.DegradeDeny),

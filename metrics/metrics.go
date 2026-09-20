@@ -26,10 +26,14 @@ type Recorder struct {
 	storeHealthy atomic.Bool
 	configVer    atomic.Value // string
 
-	requestsTotal atomic.Int64
-	allowedTotal  atomic.Int64
-	rejectTotal   atomic.Int64
-	degradeTotal  atomic.Int64
+	requestsTotal  atomic.Int64
+	allowedTotal   atomic.Int64
+	rejectTotal    atomic.Int64
+	degradeTotal   atomic.Int64
+	leaseLostTotal atomic.Int64
+	renewFailTotal atomic.Int64
+
+	degradedLocalInflight atomic.Int64
 }
 
 type latencyStats struct {
@@ -149,16 +153,29 @@ func (r *Recorder) IncConfigRejected(version string) {
 	counter(r.rejected, &r.mu, mkKey("_config", version, "invalid")).Add(1)
 }
 
+// IncLeaseLost 记录“凭证在后端丢失（TTL 到期被回收/被删除）”的事件：
+// 正常运行的实例会持续续租，出现该计数意味着发生过实例崩溃或续租中断。
+func (r *Recorder) IncLeaseLost() { r.leaseLostTotal.Add(1) }
+
+// IncRenewFailed 记录一次续租失败（网络/后端错误；不包含“凭证已丢失”）。
+func (r *Recorder) IncRenewFailed() { r.renewFailTotal.Add(1) }
+
+// AddDegradedLocalInflight 调整降级放行期间的本地在途计数（可正可负）。
+func (r *Recorder) AddDegradedLocalInflight(delta int64) { r.degradedLocalInflight.Add(delta) }
+
 // Snapshot 返回指标快照，用于日志、测试或自定义导出。
 func (r *Recorder) Snapshot() map[string]any {
 	snap := map[string]any{
-		"uptime_seconds": int64(time.Since(r.startTime).Seconds()),
-		"requests_total": r.requestsTotal.Load(),
-		"allowed_total":  r.allowedTotal.Load(),
-		"rejected_total": r.rejectTotal.Load(),
-		"degraded_total": r.degradeTotal.Load(),
-		"store_healthy":  r.storeHealthy.Load(),
-		"config_version": r.configVer.Load(),
+		"uptime_seconds":           int64(time.Since(r.startTime).Seconds()),
+		"requests_total":           r.requestsTotal.Load(),
+		"allowed_total":            r.allowedTotal.Load(),
+		"rejected_total":           r.rejectTotal.Load(),
+		"degraded_total":           r.degradeTotal.Load(),
+		"lease_lost_total":         r.leaseLostTotal.Load(),
+		"lease_renew_failed_total": r.renewFailTotal.Load(),
+		"degraded_local_inflight":  r.degradedLocalInflight.Load(),
+		"store_healthy":            r.storeHealthy.Load(),
+		"config_version":           r.configVer.Load(),
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()

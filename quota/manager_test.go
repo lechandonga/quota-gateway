@@ -406,5 +406,17 @@ func (f *failingStore) TryAcquire(context.Context, store.AcquireRequest) (store.
 }
 
 func (f *failingStore) Release(context.Context, []string, string) error { return f.err }
-func (f *failingStore) Ping(context.Context) error                      { return f.err }
-func (f *failingStore) Close() error                                    { return nil }
+func (f *failingStore) Renew(context.Context, []string, string, time.Duration) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return true, nil
+}
+func (f *failingStore) RenewAll(_ context.Context, items []store.RenewItem) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return nil, nil
+}
+func (f *failingStore) Ping(context.Context) error { return f.err }
+func (f *failingStore) Close() error               { return nil }

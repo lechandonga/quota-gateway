@@ -124,6 +124,83 @@ func (s *MemoryStore) Release(ctx context.Context, keys []string, token string) 
 	return nil
 }
 
+// Renew 续期凭证在所有给定键上的占位；任一键上凭证已丢失（被释放或已
+// 过期惰性回收）则整体不修改并返回 false，语义与 Redis Lua 一致。
+func (s *MemoryStore) Renew(ctx context.Context, keys []string, token string, ttl time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.renewLocked(keys, token, ttl, now) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// RenewAll 在同一把锁内原子批量续租多个凭证；返回未能续期（缺失/过期）
+// 的凭证 token 列表。适用于数千长连接由单个续租器统一续期的场景，避免
+// 逐个加锁造成单轮扫描在短 TTL 下超时。
+func (s *MemoryStore) RenewAll(ctx context.Context, items []RenewItem) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var missing []string
+	for _, it := range items {
+		if !s.renewLocked(it.Keys, it.Token, it.TTL, now) {
+			missing = append(missing, it.Token)
+		}
+	}
+	return missing, nil
+}
+
+// renewLocked 要求持有 s.mu：校验凭证在所有键上存在且未过期，然后整体延长。
+func (s *MemoryStore) renewLocked(keys []string, token string, ttl time.Duration, now time.Time) bool {
+	validKeys := 0
+	for _, k := range keys {
+		if k != "" {
+			validKeys++
+		}
+	}
+	if validKeys == 0 {
+		return false
+	}
+	// 1) 校验：每个键上凭证都必须存在且未过期。
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		holders := s.conc[k]
+		exp, ok := holders[token]
+		if !ok {
+			return false
+		}
+		if !exp.IsZero() && !now.Before(exp) {
+			delete(holders, token) // 已过期：顺带惰性清理
+			if len(holders) == 0 {
+				delete(s.conc, k)
+			}
+			return false
+		}
+	}
+	// 2) 提交：同一把锁内整体延长。
+	newExp := time.Time{}
+	if ttl > 0 {
+		newExp = now.Add(ttl)
+	}
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		s.conc[k][token] = newExp
+	}
+	return true
+}
+
 func (s *MemoryStore) Ping(ctx context.Context) error { return ctx.Err() }
 
 func (s *MemoryStore) Close() error {

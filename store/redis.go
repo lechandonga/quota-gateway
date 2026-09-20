@@ -121,6 +121,72 @@ if redis.call('HLEN', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
 return removed
 `
 
+// renewScript 为长请求续租：仅当 token 在所有给定键上都仍存在且未过期时，
+// 原子地把每个键上的过期时刻延长到 now+ttl；任一键缺失则不修改任何键。
+// KEYS[1..N]=并发占位键（租户键、共享键）
+// ARGV: token now_ms ttl_ms
+// 返回 1=已续期，0=凭证已丢失（被释放或 TTL 到期被回收）
+const renewScript = `
+local now = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+for i = 1, #KEYS do
+  local exp = tonumber(redis.call('HGET', KEYS[i], ARGV[1]))
+  if exp == nil then return 0 end
+  if exp > 0 and exp <= now then
+    redis.call('HDEL', KEYS[i], ARGV[1])
+    return 0
+  end
+end
+local newexp = 0
+if ttl > 0 then newexp = now + ttl end
+for i = 1, #KEYS do
+  redis.call('HSET', KEYS[i], ARGV[1], tostring(newexp))
+end
+return 1
+`
+
+// renewAllScript 批量续租多个凭证，单脚本原子完成（一次往返），避免数千
+// 长连接逐个续租产生 O(n) 往返。入参为紧凑的三元组序列：
+//
+//	ARGV[1] = now_ms, ARGV[2] = ttl_ms（所有凭证统一 TTL），
+//	其后每组三个参数： token, numkeys, key1,key2,...（numkeys 内联在参数流中）
+//
+// 返回未能续期（缺失/过期）的 token 数组；空数组表示全部成功。
+const renewAllScript = `
+local now = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local newexp = 0
+if ttl > 0 then newexp = now + ttl end
+local missing = {}
+local i = 3
+while i <= #ARGV do
+  local token = ARGV[i]
+  local nk = tonumber(ARGV[i+1])
+  local ok = true
+  for j = i+2, i+1+nk do
+    local exp = tonumber(redis.call('HGET', ARGV[j], token))
+    if exp == nil then
+      ok = false
+      break
+    end
+    if exp > 0 and exp <= now then
+      redis.call('HDEL', ARGV[j], token)
+      ok = false
+      break
+    end
+  end
+  if ok then
+    for j = i+2, i+1+nk do
+      redis.call('HSET', ARGV[j], token, tostring(newexp))
+    end
+  else
+    missing[#missing+1] = token
+  end
+  i = i + 2 + nk
+end
+return missing
+`
+
 // RedisStore 通过 Redis Lua 脚本实现跨实例原子配额。
 //
 // 多实例语义：所有判定在 Redis 单线程内以单个 Lua 脚本原子执行，
@@ -130,6 +196,8 @@ type RedisStore struct {
 	cl          *redisClient
 	shaTry      string
 	shaRelease  string
+	shaRenew    string
+	shaRenewAll string
 	scriptMu    sync.Mutex
 	loaded      bool
 	dialTimeout time.Duration
@@ -173,7 +241,23 @@ func (s *RedisStore) ensureScripts(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.shaTry, s.shaRelease, s.loaded = sha1, sha2, true
+	v, err = s.cl.do(ctx, "SCRIPT", "LOAD", renewScript)
+	if err != nil {
+		return err
+	}
+	sha3, err := strReply(v)
+	if err != nil {
+		return err
+	}
+	v, err = s.cl.do(ctx, "SCRIPT", "LOAD", renewAllScript)
+	if err != nil {
+		return err
+	}
+	sha4, err := strReply(v)
+	if err != nil {
+		return err
+	}
+	s.shaTry, s.shaRelease, s.shaRenew, s.shaRenewAll, s.loaded = sha1, sha2, sha3, sha4, true
 	return nil
 }
 
@@ -253,6 +337,93 @@ func (s *RedisStore) markStale() {
 	s.scriptMu.Lock()
 	s.loaded = false
 	s.scriptMu.Unlock()
+}
+
+// Renew 通过单条 Lua 脚本原子续期凭证在所有键上的占位。
+func (s *RedisStore) Renew(ctx context.Context, keys []string, token string, ttl time.Duration) (bool, error) {
+	if err := s.ensureScripts(ctx); err != nil {
+		return false, err
+	}
+	rkeys := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		rkeys = append(rkeys, s.cl.key(k))
+	}
+	if len(rkeys) == 0 {
+		return false, nil
+	}
+	args := []string{
+		token,
+		strconv.FormatInt(time.Now().UnixMilli(), 10),
+		strconv.FormatInt(ttl.Milliseconds(), 10),
+	}
+	v, err := s.cl.eval(ctx, s.shaRenew, renewScript, rkeys, args)
+	if err != nil {
+		if isNoScript(err) { // 主从切换/重启清空脚本缓存：下次自动重新 LOAD
+			s.markStale()
+		}
+		return false, err
+	}
+	n, err := atoiReply(v)
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// RenewAll 通过单条 Lua 脚本一次往返批量续租所有凭证。
+func (s *RedisStore) RenewAll(ctx context.Context, items []RenewItem) ([]string, error) {
+	if err := s.ensureScripts(ctx); err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	now := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	// 统一使用一个 TTL（调用方传入当前生效值）。
+	ttl := items[0].TTL.Milliseconds()
+	args := make([]string, 0, 2+len(items)*4)
+	args = append(args, now, strconv.FormatInt(ttl, 10))
+	for _, it := range items {
+		nk := 0
+		for _, k := range it.Keys {
+			if k != "" {
+				nk++
+			}
+		}
+		if nk == 0 {
+			continue
+		}
+		args = append(args, it.Token, strconv.Itoa(nk))
+		for _, k := range it.Keys {
+			if k != "" {
+				args = append(args, s.cl.key(k))
+			}
+		}
+	}
+	// 键内联在 ARGV 三元组流中，numkeys 传 0；单条脚本原子完成批量续租。
+	v, err := s.cl.eval(ctx, s.shaRenewAll, renewAllScript, nil, args)
+	if err != nil {
+		if isNoScript(err) {
+			s.markStale()
+		}
+		return nil, err
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, errRedisProto
+	}
+	missing := make([]string, 0, len(arr))
+	for _, e := range arr {
+		tok, err := strReply(e)
+		if err != nil {
+			return nil, err
+		}
+		missing = append(missing, tok)
+	}
+	return missing, nil
 }
 
 func (s *RedisStore) Ping(ctx context.Context) error { return s.cl.ping(ctx) }

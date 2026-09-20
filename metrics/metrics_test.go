@@ -50,3 +50,22 @@ func TestRecorder_DegradedCounter(t *testing.T) {
 		t.Fatal("degraded_total mismatch")
 	}
 }
+
+func TestRecorder_LeaseAndDegradeLocalMetrics(t *testing.T) {
+	r := newTestRecorder()
+	r.IncLeaseLost()
+	r.IncLeaseLost()
+	r.IncRenewFailed()
+	r.AddDegradedLocalInflight(3)
+	r.AddDegradedLocalInflight(-1)
+	snap := r.Snapshot()
+	if got := snap["lease_lost_total"]; got != int64(2) {
+		t.Fatalf("lease_lost_total=%v want 2", got)
+	}
+	if got := snap["lease_renew_failed_total"]; got != int64(1) {
+		t.Fatalf("lease_renew_failed_total=%v want 1", got)
+	}
+	if got := snap["degraded_local_inflight"]; got != int64(2) {
+		t.Fatalf("degraded_local_inflight=%v want 2", got)
+	}
+}

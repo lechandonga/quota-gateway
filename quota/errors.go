@@ -14,12 +14,13 @@ type ErrorCode string
 
 // 预定义错误码。
 const (
-	ErrCodeRateLimited        ErrorCode = "rate_limited"
-	ErrCodeConcurrencyLimited ErrorCode = "concurrency_limited"
-	ErrCodeUnavailable        ErrorCode = "quota_backend_unavailable"
-	ErrCodeDegradedDeny       ErrorCode = "degraded_deny"
-	ErrCodeInvalidConfig      ErrorCode = "invalid_config"
-	ErrCodeInternal           ErrorCode = "internal"
+	ErrCodeRateLimited          ErrorCode = "rate_limited"
+	ErrCodeConcurrencyLimited   ErrorCode = "concurrency_limited"
+	ErrCodeUnavailable          ErrorCode = "quota_backend_unavailable"
+	ErrCodeDegradedDeny         ErrorCode = "degraded_deny"
+	ErrCodeDegradedLocalLimited ErrorCode = "degraded_local_concurrency_limited"
+	ErrCodeInvalidConfig        ErrorCode = "invalid_config"
+	ErrCodeInternal             ErrorCode = "internal"
 )
 
 // Error 描述一次配额拒绝或降级事件。
@@ -110,6 +111,18 @@ func newDegradedDenyError(tenant, api string) *Error {
 		Tenant:  tenant,
 		API:     api,
 		Message: "quota backend unavailable and degrade policy is deny",
+	}
+}
+
+// newDegradedLocalLimitedError 表示后端不可用 fail-open 期间，请求已达到
+// 本实例对该 (租户,接口) 的本地并发硬上限（与后端恢复后的 429 同构）。
+func newDegradedLocalLimitedError(tenant, api string) *Error {
+	return &Error{
+		Code:       ErrCodeDegradedLocalLimited,
+		Tenant:     tenant,
+		API:        api,
+		Message:    "quota backend unavailable (fail-open) and local concurrency cap reached",
+		RetryAfter: time.Second,
 	}
 }
 

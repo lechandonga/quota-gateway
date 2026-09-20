@@ -3,6 +3,7 @@
   "defaultWeight": 1,
   "degrade": "deny",
   "globalMaxConcurrent": 100,
+  "concurrencyTTLSeconds": 30,
   "rules": [
     {
       "tenant": "team-alpha",

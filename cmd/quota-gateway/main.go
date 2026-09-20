@@ -36,6 +36,7 @@ func main() {
 		keyPrefix      = flag.String("key-prefix", "quota-gateway", "Redis 键前缀")
 		reloadInterval = flag.Duration("reload-interval", 2*time.Second, "配置文件轮询热更新间隔；<=0 表示仅响应 SIGHUP")
 		healthInterval = flag.Duration("health-interval", time.Second, "后端健康探测间隔")
+		leaseTTL       = flag.Duration("lease-ttl", 0, "并发占位租约 TTL（实例崩溃后的有界回收时间）；<=0 使用默认 30s，配置文件 concurrencyTTLSeconds 优先")
 	)
 	flag.Parse()
 
@@ -69,10 +70,11 @@ func main() {
 		cfg = c
 	}
 	m, err := quota.NewManager(quota.Options{
-		Store:   st,
-		Config:  cfg,
-		Metrics: rec,
-		Logger:  logger,
+		Store:          st,
+		Config:         cfg,
+		Metrics:        rec,
+		Logger:         logger,
+		ConcurrencyTTL: *leaseTTL,
 	})
 	if err != nil {
 		log.Fatalf("初始化配额管理器失败: %v", err)

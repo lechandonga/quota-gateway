@@ -211,6 +211,10 @@ func (f *fakeRedis) eval(args []string) string {
 		return f.runTryAcquire(keys, argv)
 	case releaseScript:
 		return f.runRelease(keys, argv)
+	case renewScript:
+		return f.runRenew(keys, argv)
+	case renewAllScript:
+		return f.runRenewAll(keys, argv)
 	default:
 		return encErr("ERR unknown script")
 	}
@@ -359,4 +363,79 @@ func (f *fakeRedis) runRelease(keys, argv []string) string {
 		removed = 1
 	}
 	return encInt(int64(removed))
+}
+
+// runRenew 与 renewScript 等价：所有键上凭证都存在且未过期才整体延长。
+func (f *fakeRedis) runRenew(keys, argv []string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	token := argv[0]
+	now, _ := strconv.ParseInt(argv[1], 10, 64)
+	ttl, _ := strconv.ParseInt(argv[2], 10, 64)
+	for _, k := range keys {
+		h := f.data[k]
+		v, ok := h[token]
+		if !ok {
+			return encInt(0)
+		}
+		exp, _ := strconv.ParseInt(v, 10, 64)
+		if exp > 0 && exp <= now {
+			delete(h, token)
+			return encInt(0)
+		}
+	}
+	newExp := int64(0)
+	if ttl > 0 {
+		newExp = now + ttl
+	}
+	for _, k := range keys {
+		f.data[k][token] = strconv.FormatInt(newExp, 10)
+	}
+	return encInt(1)
+}
+
+// runRenewAll 与 renewAllScript 等价：键内联在 ARGV 三元组流中，
+// 返回未能续期的 token 数组（空数组表示全部成功）。
+func (f *fakeRedis) runRenewAll(_ []string, argv []string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now, _ := strconv.ParseInt(argv[0], 10, 64)
+	ttl, _ := strconv.ParseInt(argv[1], 10, 64)
+	newExp := int64(0)
+	if ttl > 0 {
+		newExp = now + ttl
+	}
+	var missing []string
+	i := 2
+	for i < len(argv) {
+		token := argv[i]
+		nk, _ := strconv.Atoi(argv[i+1])
+		ok := true
+		for j := i + 2; j < i+2+nk; j++ {
+			k := argv[j]
+			h := f.data[k]
+			v, exists := h[token]
+			if !exists {
+				ok = false
+				break
+			}
+			exp, _ := strconv.ParseInt(v, 10, 64)
+			if exp > 0 && exp <= now {
+				delete(h, token)
+				ok = false
+				break
+			}
+		}
+		if ok {
+			for j := i + 2; j < i+2+nk; j++ {
+				put(f.data, argv[j], token, newExp)
+			}
+		} else {
+			missing = append(missing, token)
+		}
+		i += 2 + nk
+	}
+	out := make([]string, 0, len(missing))
+	out = append(out, missing...)
+	return encArr(out)
 }
