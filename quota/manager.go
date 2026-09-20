@@ -20,8 +20,15 @@ const (
 	DefaultConcurrencyTTL = 30 * time.Second
 	// DefaultQueueTimeout 是容量竞争时公平排队的最长等待。
 	DefaultQueueTimeout = 1 * time.Second
+	// DefaultDegradeMaxConcurrent 是降级放行期间、规则未配置并发上限时
+	// 每个 (租户, 接口) 的本地在途硬上限（防止 fail-open 拖垮实例）。
+	DefaultDegradeMaxConcurrent = 1024
 
 	releaseTimeout = 2 * time.Second // Release 访问后端的最长时间
+
+	// minRenewInterval / minReapInterval 防止后台循环周期被配置得过密。
+	minRenewInterval = 10 * time.Millisecond
+	minReapInterval  = 10 * time.Millisecond
 )
 
 // 内部判定哨兵错误：把“原子判定的终止原因”从调度回调传回 Acquire。
@@ -47,26 +54,51 @@ type Options struct {
 	Config         *Config
 	InstanceID     string
 	ConcurrencyTTL time.Duration
+	// RenewInterval 是在途租约的续租周期；<=0 时取 ConcurrencyTTL/3。
+	// 只要请求在途且实例存活，名额就会被持续续租，不会被提前回收。
+	RenewInterval time.Duration
+	// ReapInterval 是“调用方 ctx 已取消但尚未释放”的租约回收周期；
+	// <=0 时取 100ms。与连接数无关，整个 Manager 仅一个后台循环。
+	ReapInterval time.Duration
 	// QueueTimeout 限制共享容量竞争时的公平排队时间；<=0 使用默认值。
 	QueueTimeout time.Duration
-	Metrics      *metrics.Recorder
-	Logger       Logger
-	Now          func() time.Time
+	// DegradeMaxConcurrent 是降级放行期间、规则未配置 MaxConcurrent 时
+	// 每个 (租户, 接口) 的本地在途硬上限；<=0 使用默认值。
+	// 规则已配置 MaxConcurrent 时，降级放行始终遵守该硬上限。
+	DegradeMaxConcurrent int64
+	Metrics              *metrics.Recorder
+	Logger               Logger
+	Now                  func() time.Time
 }
 
 // Manager 组合存储、配置与公平调度，对外提供配额判定。
 type Manager struct {
-	st           store.Store
-	cfg          atomic.Pointer[Config]
-	sched        *fairScheduler
-	metrics      *metrics.Recorder
-	logger       Logger
-	now          func() time.Time
-	instance     string
-	concTTL      time.Duration
-	queueTimeout time.Duration
-	tokenSeq     atomic.Uint64
-	closeOnce    sync.Once
+	st            store.Store
+	cfg           atomic.Pointer[Config]
+	sched         *fairScheduler
+	metrics       *metrics.Recorder
+	logger        Logger
+	now           func() time.Time
+	instance      string
+	concTTL       time.Duration
+	renewInterval time.Duration
+	reapInterval  time.Duration
+	queueTimeout  time.Duration
+	tokenSeq      atomic.Uint64
+	closeOnce     sync.Once
+
+	leases   *leaseRegistry
+	loopStop chan struct{}
+	loopWg   sync.WaitGroup
+
+	reapMu      sync.Mutex
+	reapRunning bool
+
+	// 降级放行的本地兜底：后端不可用时按 (租户, 接口) 计数的本地在途，
+	// 受规则硬上限约束；恢复后从统一计账中扣除，避免额度放大。
+	degMu       sync.Mutex
+	degInflight map[string]int64
+	degradeMax  int64
 }
 
 // NewManager 创建管理器并校验初始配置。
@@ -93,6 +125,24 @@ func NewManager(opts Options) (*Manager, error) {
 	if qt <= 0 {
 		qt = DefaultQueueTimeout
 	}
+	renew := opts.RenewInterval
+	if renew <= 0 {
+		renew = ttl / 3
+	}
+	if renew < minRenewInterval {
+		renew = minRenewInterval
+	}
+	reap := opts.ReapInterval
+	if reap <= 0 {
+		reap = 100 * time.Millisecond
+	}
+	if reap < minReapInterval {
+		reap = minReapInterval
+	}
+	degMax := opts.DegradeMaxConcurrent
+	if degMax <= 0 {
+		degMax = DefaultDegradeMaxConcurrent
+	}
 	lg := opts.Logger
 	if lg == nil {
 		lg = discardLogger{}
@@ -102,19 +152,27 @@ func NewManager(opts Options) (*Manager, error) {
 		now = time.Now
 	}
 	m := &Manager{
-		st:           opts.Store,
-		sched:        newFairScheduler(),
-		metrics:      opts.Metrics,
-		logger:       lg,
-		now:          now,
-		instance:     id,
-		concTTL:      ttl,
-		queueTimeout: qt,
+		st:            opts.Store,
+		sched:         newFairScheduler(),
+		metrics:       opts.Metrics,
+		logger:        lg,
+		now:           now,
+		instance:      id,
+		concTTL:       ttl,
+		renewInterval: renew,
+		reapInterval:  reap,
+		queueTimeout:  qt,
+		leases:        newLeaseRegistry(),
+		loopStop:      make(chan struct{}),
+		degInflight:   make(map[string]int64),
+		degradeMax:    degMax,
 	}
 	m.cfg.Store(cfg)
 	if m.metrics != nil && cfg != nil {
 		m.metrics.SetConfigVersion(cfg.Version)
 	}
+	m.loopWg.Add(1)
+	go m.leaseLoop()
 	return m, nil
 }
 
@@ -127,10 +185,14 @@ func NewManager(opts Options) (*Manager, error) {
 //   - 共享容量池竞争：成为公平队首后原子判定，未抢到容量则在队列内等待
 //     （由 Release 广播唤醒重试），按租户 Weight 加权排序；受 ctx 与
 //     QueueTimeout 双重约束，队列超时按并发超限拒绝；
-//   - 后端不可用：按 Degrade 策略 fail-open 放行或 fail-closed 拒绝；
+//   - 后端不可用：按 Degrade 策略 fail-closed 拒绝，或 fail-open 本地
+//     兜底放行（仍受该租户并发硬上限约束，见 degradeAllow）；
 //   - ctx 取消（如客户端断连）不产生任何占位。
 //
-// 返回的 ReleaseFunc 幂等：正常结束、超时、客户端中断（defer release）、
+// 成功获取的名额由后台租约循环续租：请求在途多久都不会被提前回收；
+// 持有实例崩溃时名额在 ConcurrencyTTL 内有界回收。
+//
+// 返回的 ReleaseFunc 幂等：正常结束、超时、客户端中断（后台回收）、
 // 重复调用、乱序调用都安全；存储异常路径另有占位 TTL 兜底。
 func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc, error) {
 	if err := ctx.Err(); err != nil {
@@ -167,6 +229,19 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 	releaseKeys := []string{req.ConcKey}
 	if sharedKey != "" {
 		releaseKeys = append(releaseKeys, sharedKey)
+	}
+
+	// 降级恢复过渡：本地降级在途不写入后端，这里从租户硬上限中扣除，
+	// 使“后端占用 + 本地降级在途”之和不超过配置上限（不放大、不重复计数）；
+	// 本地在途随请求结束自然归零后自动恢复全额。
+	if req.MaxConcurrent > 0 {
+		if n := m.degradedLocal(tenant, api); n > 0 {
+			if n >= req.MaxConcurrent {
+				m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
+				return nil, newConcurrencyLimitedError(tenant, api, m.reapInterval)
+			}
+			req.MaxConcurrent -= n
+		}
 	}
 
 	// 原子判定在“成为公平队首”时执行；未配置共享池时只判定一次。
@@ -215,7 +290,7 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 		m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
 		return nil, newConcurrencyLimitedError(tenant, api, res.RetryAfter)
 	case errors.Is(admErr, errRejBackend):
-		return m.degrade(cfg, tenant, api, backendCause)
+		return m.degrade(ctx, cfg, tenant, api, rule, backendCause)
 	case errors.Is(admErr, context.DeadlineExceeded) && ctx.Err() == nil:
 		// 公平排队超过 QueueTimeout（调用方自身 ctx 未到期）。
 		m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
@@ -228,9 +303,13 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 	if m.metrics != nil {
 		m.metrics.IncAllowed(tenant, api)
 	}
+	// 登记在途租约：后台循环负责续租（长连接名额不被提前回收）与
+	// ctx 取消回收（客户端断连但 handler 未返回时名额有界释放）。
+	entry := &leaseEntry{token: token, keys: releaseKeys, ctx: ctx}
 	var once sync.Once
 	release := func() {
 		once.Do(func() {
+			m.leases.remove(token)
 			// 独立 context：请求结束（含客户端中断）也必须尽力释放，
 			// 防止长连接异常路径造成并发占用泄漏。
 			rctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
@@ -247,26 +326,97 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 			}
 		})
 	}
+	entry.release = release
+	m.leases.add(entry)
 	if m.metrics != nil {
 		m.metrics.IncInflight(tenant, api)
 	}
 	return release, nil
 }
 
-// degrade 按配置处理后端不可用：Deny 返回可解释错误；Allow 放行并记录指标。
-func (m *Manager) degrade(cfg *Config, tenant, api string, cause error) (ReleaseFunc, error) {
+// degrade 按配置处理后端不可用：Deny 返回可解释错误；Allow 走本地兜底放行。
+func (m *Manager) degrade(ctx context.Context, cfg *Config, tenant, api string, rule Rule, cause error) (ReleaseFunc, error) {
 	m.logger.Printf("quota: backend unavailable tenant=%s api=%s policy=%s err=%v",
 		tenant, api, cfg.Degrade, cause)
 	if m.metrics != nil {
 		m.metrics.SetStoreHealthy(false)
-		m.metrics.IncDegraded(tenant, api, cfg.Degrade.String())
 	}
 	if cfg.Degrade == DegradeAllow {
-		// fail-open：放行且不占用后端并发额度，释放为 no-op。
-		return noopRelease, nil
+		return m.degradeAllow(ctx, tenant, api, rule)
+	}
+	if m.metrics != nil {
+		m.metrics.IncDegraded(tenant, api, DegradeDeny.String())
 	}
 	m.recordReject(tenant, api, string(ErrCodeDegradedDeny))
 	return nil, newDegradedDenyError(tenant, api)
+}
+
+// degradeAllow 本地兜底放行：不占用后端额度，但遵守该 (租户, 接口) 的
+// 并发硬上限（规则未配置时用 DegradeMaxConcurrent 默认值），本地计数、
+// 本地回收、可观测；达到本地上限时按并发超限拒绝（可解释、带重试提示）。
+//
+// 恢复语义：降级期间的在途请求始终只计在本地，从不写入后端，因此后端
+// 恢复后不会被重复计数；同时正常获取路径会把本地在途数从租户硬上限中
+// 扣除，使“后端占用 + 本地降级在途”之和始终不超过配置上限（不放大额度），
+// 本地在途随请求结束自然归零后恢复全额。
+func (m *Manager) degradeAllow(ctx context.Context, tenant, api string, rule Rule) (ReleaseFunc, error) {
+	limit := rule.MaxConcurrent
+	if limit <= 0 {
+		limit = m.degradeMax
+	}
+	key := tenant + "\x00" + api
+	m.degMu.Lock()
+	n := m.degInflight[key]
+	if limit > 0 && n >= limit {
+		m.degMu.Unlock()
+		m.logger.Printf("quota: degrade allow but local cap reached tenant=%s api=%s inflight=%d cap=%d",
+			tenant, api, n, limit)
+		if m.metrics != nil {
+			m.metrics.IncDegraded(tenant, api, "local_limited")
+		}
+		m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
+		return nil, newConcurrencyLimitedError(tenant, api, m.reapInterval)
+	}
+	m.degInflight[key] = n + 1
+	m.degMu.Unlock()
+
+	if m.metrics != nil {
+		m.metrics.IncDegraded(tenant, api, DegradeAllow.String())
+		m.metrics.IncDegradedInflight(tenant, api)
+		m.metrics.IncInflight(tenant, api)
+		m.metrics.IncAllowed(tenant, api)
+	}
+	// 登记租约（无后端键）：客户端断连但 handler 未返回时由后台循环回收。
+	token := m.newToken()
+	entry := &leaseEntry{token: token, ctx: ctx}
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			m.leases.remove(token)
+			m.degMu.Lock()
+			if m.degInflight[key] > 0 {
+				m.degInflight[key]--
+			}
+			if m.degInflight[key] == 0 {
+				delete(m.degInflight, key)
+			}
+			m.degMu.Unlock()
+			if m.metrics != nil {
+				m.metrics.DecDegradedInflight(tenant, api)
+				m.metrics.DecInflight(tenant, api)
+			}
+		})
+	}
+	entry.release = release
+	m.leases.add(entry)
+	return release, nil
+}
+
+// degradedLocal 返回该 (租户, 接口) 当前降级放行的本地在途数。
+func (m *Manager) degradedLocal(tenant, api string) int64 {
+	m.degMu.Lock()
+	defer m.degMu.Unlock()
+	return m.degInflight[tenant+"\x00"+api]
 }
 
 // UpdateConfig 热更新配置：先校验，非法或不兼容时保持旧配置不变。
@@ -314,10 +464,14 @@ func (m *Manager) SetStoreHealthy(healthy bool) {
 	}
 }
 
-// Close 关闭管理器与底层存储。
+// Close 停止后台租约循环并关闭底层存储。
 func (m *Manager) Close() error {
 	var err error
-	m.closeOnce.Do(func() { err = m.st.Close() })
+	m.closeOnce.Do(func() {
+		close(m.loopStop)
+		m.loopWg.Wait()
+		err = m.st.Close()
+	})
 	return err
 }
 

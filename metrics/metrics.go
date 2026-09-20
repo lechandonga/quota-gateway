@@ -22,6 +22,8 @@ type Recorder struct {
 	degraded map[string]*atomic.Int64 // key: tenant|api|action
 	latency  map[string]*latencyStats // key: tenant|api
 	inflight map[string]*atomic.Int64
+	// degradedInflight 是降级放行期间本地兜底的在途计数（未占用后端额度）。
+	degradedInflight map[string]*atomic.Int64
 
 	storeHealthy atomic.Bool
 	configVer    atomic.Value // string
@@ -52,13 +54,14 @@ func New() *Recorder {
 		return defaultRecorder
 	}
 	r := &Recorder{
-		startTime: time.Now(),
-		requests:  make(map[string]*atomic.Int64),
-		allowed:   make(map[string]*atomic.Int64),
-		rejected:  make(map[string]*atomic.Int64),
-		degraded:  make(map[string]*atomic.Int64),
-		latency:   make(map[string]*latencyStats),
-		inflight:  make(map[string]*atomic.Int64),
+		startTime:        time.Now(),
+		requests:         make(map[string]*atomic.Int64),
+		allowed:          make(map[string]*atomic.Int64),
+		rejected:         make(map[string]*atomic.Int64),
+		degraded:         make(map[string]*atomic.Int64),
+		latency:          make(map[string]*latencyStats),
+		inflight:         make(map[string]*atomic.Int64),
+		degradedInflight: make(map[string]*atomic.Int64),
 	}
 	r.storeHealthy.Store(true)
 	r.configVer.Store("")
@@ -141,6 +144,15 @@ func (r *Recorder) SetInflight(tenant, api string, n int64) {
 	counter(r.inflight, &r.mu, mkKey(tenant, api)).Store(n)
 }
 
+// IncDegradedInflight / DecDegradedInflight 记录降级放行的本地在途数。
+func (r *Recorder) IncDegradedInflight(tenant, api string) {
+	counter(r.degradedInflight, &r.mu, mkKey(tenant, api)).Add(1)
+}
+
+func (r *Recorder) DecDegradedInflight(tenant, api string) {
+	counter(r.degradedInflight, &r.mu, mkKey(tenant, api)).Add(-1)
+}
+
 func (r *Recorder) SetStoreHealthy(healthy bool) { r.storeHealthy.Store(healthy) }
 
 func (r *Recorder) SetConfigVersion(version string) { r.configVer.Store(version) }
@@ -174,6 +186,7 @@ func (r *Recorder) Snapshot() map[string]any {
 	snap["rejected_by_key"] = add("rejected", r.rejected)
 	snap["degraded_by_key"] = add("degraded", r.degraded)
 	snap["inflight_by_key"] = add("inflight", r.inflight)
+	snap["degraded_inflight_by_key"] = add("degraded_inflight", r.degradedInflight)
 	lat := make(map[string]map[string]int64, len(r.latency))
 	keys := make([]string, 0, len(r.latency))
 	for k := range r.latency {
