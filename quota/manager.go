@@ -98,7 +98,11 @@ type Manager struct {
 	// 受规则硬上限约束；恢复后从统一计账中扣除，避免额度放大。
 	degMu       sync.Mutex
 	degInflight map[string]int64
-	degradeMax  int64
+	// localBackend 是本实例内经后端正常计账的在途数（按 租户\x00接口）。
+	// 降级放行时与 degInflight 合并判定上限：保证“故障前已在跑的 +
+	// 放行期间新进的”之和也不超过配置上限，且该上限本地可见、可回收。
+	localBackend map[string]int64
+	degradeMax   int64
 }
 
 // NewManager 创建管理器并校验初始配置。
@@ -165,6 +169,7 @@ func NewManager(opts Options) (*Manager, error) {
 		leases:        newLeaseRegistry(),
 		loopStop:      make(chan struct{}),
 		degInflight:   make(map[string]int64),
+		localBackend:  make(map[string]int64),
 		degradeMax:    degMax,
 	}
 	m.cfg.Store(cfg)
@@ -226,11 +231,6 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 		Token:         token,
 		TTL:           m.concTTL,
 	}
-	releaseKeys := []string{req.ConcKey}
-	if sharedKey != "" {
-		releaseKeys = append(releaseKeys, sharedKey)
-	}
-
 	// 降级恢复过渡：本地降级在途不写入后端，这里从租户硬上限中扣除，
 	// 使“后端占用 + 本地降级在途”之和不超过配置上限（不放大、不重复计数）；
 	// 本地在途随请求结束自然归零后自动恢复全额。
@@ -242,6 +242,17 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 			}
 			req.MaxConcurrent -= n
 		}
+	}
+
+	// 释放/续租键集合只含真正写了占位的键（MaxConcurrent>0 时后端才有
+	// 租户并发占位）：续租是“确保占位存在”语义，多带无占位的键会被
+	// 续租重建出幻影占位。
+	releaseKeys := []string(nil)
+	if req.MaxConcurrent > 0 {
+		releaseKeys = append(releaseKeys, req.ConcKey)
+	}
+	if sharedKey != "" {
+		releaseKeys = append(releaseKeys, sharedKey)
 	}
 
 	// 原子判定在“成为公平队首”时执行；未配置共享池时只判定一次。
@@ -303,13 +314,27 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 	if m.metrics != nil {
 		m.metrics.IncAllowed(tenant, api)
 	}
+	// 本实例“后端计账在途”+1：降级放行时与本地降级在途合并判定上限，
+	// 保证故障前在途 + 放行新进之和也不超过配置上限。
+	infKey := tenant + "\x00" + api
+	m.degMu.Lock()
+	m.localBackend[infKey]++
+	m.degMu.Unlock()
 	// 登记在途租约：后台循环负责续租（长连接名额不被提前回收）与
 	// ctx 取消回收（客户端断连但 handler 未返回时名额有界释放）。
-	entry := &leaseEntry{token: token, keys: releaseKeys, ctx: ctx}
+	entry := &leaseEntry{token: token, tenant: tenant, api: api, keys: releaseKeys, ctx: ctx}
 	var once sync.Once
 	release := func() {
 		once.Do(func() {
 			m.leases.remove(token)
+			m.degMu.Lock()
+			if m.localBackend[infKey] > 0 {
+				m.localBackend[infKey]--
+			}
+			if m.localBackend[infKey] == 0 {
+				delete(m.localBackend, infKey)
+			}
+			m.degMu.Unlock()
 			// 独立 context：请求结束（含客户端中断）也必须尽力释放，
 			// 防止长连接异常路径造成并发占用泄漏。
 			rctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
@@ -355,6 +380,11 @@ func (m *Manager) degrade(ctx context.Context, cfg *Config, tenant, api string, 
 // 并发硬上限（规则未配置时用 DegradeMaxConcurrent 默认值），本地计数、
 // 本地回收、可观测；达到本地上限时按并发超限拒绝（可解释、带重试提示）。
 //
+// 上限判定是合并口径：本实例“故障前经后端正常计账、仍在运行的在途”
+// （localBackend）也算入——后端短暂不可用期间这些请求的后端名额仍然
+// 有效，若只算本地降级在途，两批合计可达上限两倍。合并判定保证本实例
+// 上该租户同时运行的请求数绝不超过配置上限。
+//
 // 恢复语义：降级期间的在途请求始终只计在本地，从不写入后端，因此后端
 // 恢复后不会被重复计数；同时正常获取路径会把本地在途数从租户硬上限中
 // 扣除，使“后端占用 + 本地降级在途”之和始终不超过配置上限（不放大额度），
@@ -366,18 +396,18 @@ func (m *Manager) degradeAllow(ctx context.Context, tenant, api string, rule Rul
 	}
 	key := tenant + "\x00" + api
 	m.degMu.Lock()
-	n := m.degInflight[key]
-	if limit > 0 && n >= limit {
+	backend, degraded := m.localBackend[key], m.degInflight[key]
+	if limit > 0 && backend+degraded >= limit {
 		m.degMu.Unlock()
-		m.logger.Printf("quota: degrade allow but local cap reached tenant=%s api=%s inflight=%d cap=%d",
-			tenant, api, n, limit)
+		m.logger.Printf("quota: degrade allow but local cap reached tenant=%s api=%s inflight=%d (backend=%d degraded=%d) cap=%d",
+			tenant, api, backend+degraded, backend, degraded, limit)
 		if m.metrics != nil {
 			m.metrics.IncDegraded(tenant, api, "local_limited")
 		}
 		m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
 		return nil, newConcurrencyLimitedError(tenant, api, m.reapInterval)
 	}
-	m.degInflight[key] = n + 1
+	m.degInflight[key] = degraded + 1
 	m.degMu.Unlock()
 
 	if m.metrics != nil {
@@ -388,7 +418,7 @@ func (m *Manager) degradeAllow(ctx context.Context, tenant, api string, rule Rul
 	}
 	// 登记租约（无后端键）：客户端断连但 handler 未返回时由后台循环回收。
 	token := m.newToken()
-	entry := &leaseEntry{token: token, ctx: ctx}
+	entry := &leaseEntry{token: token, tenant: tenant, api: api, ctx: ctx}
 	var once sync.Once
 	release := func() {
 		once.Do(func() {
@@ -417,6 +447,17 @@ func (m *Manager) degradedLocal(tenant, api string) int64 {
 	m.degMu.Lock()
 	defer m.degMu.Unlock()
 	return m.degInflight[tenant+"\x00"+api]
+}
+
+// LocalInflight 返回本实例上该 (租户, 接口) 的在途分解：
+// backend 为经后端正常计账的在途，degraded 为降级放行期间本地兜底的在途。
+// 二者之和即本实例该租户的总在途——降级放行期间同样受配置上限约束，
+// 该视图使上限与占用在本地直接可见（无需查询后端）。
+func (m *Manager) LocalInflight(tenant, api string) (backend, degraded int64) {
+	m.degMu.Lock()
+	defer m.degMu.Unlock()
+	k := tenant + "\x00" + api
+	return m.localBackend[k], m.degInflight[k]
 }
 
 // UpdateConfig 热更新配置：先校验，非法或不兼容时保持旧配置不变。

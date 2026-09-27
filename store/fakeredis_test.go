@@ -41,6 +41,13 @@ func (f *fakeRedis) addr() string { return f.ln.Addr().String() }
 
 func (f *fakeRedis) close() { _ = f.ln.Close() }
 
+// flushAll 清空全部键数据（模拟后端重启/故障转移导致记录丢失）。
+func (f *fakeRedis) flushAll() {
+	f.mu.Lock()
+	f.data = map[string]map[string]string{}
+	f.mu.Unlock()
+}
+
 func (f *fakeRedis) serve() {
 	for {
 		c, err := f.ln.Accept()
@@ -363,27 +370,42 @@ func (f *fakeRedis) runRelease(keys, argv []string) string {
 	return encInt(int64(removed))
 }
 
-// runRenew 与 renewScript 等价的 Go 实现：仅刷新仍存在的占位。
+// runRenew 与 renewScript 等价的 Go 实现：确保占位存在，
+// 缺失的重建并作为 lost 数组返回。
 func (f *fakeRedis) runRenew(keys, argv []string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	ttl, _ := strconv.ParseInt(argv[1], 10, 64)
 	if ttl <= 0 {
-		return encInt(0)
+		return encStrArr(nil)
 	}
 	exp := strconv.FormatInt(time.Now().UnixMilli()+ttl, 10)
-	renewed := 0
+	var lost []string
 	for _, tok := range argv[2:] {
+		missing := false
 		for _, key := range keys {
 			h := f.data[key]
 			if h == nil {
-				continue
+				h = map[string]string{}
+				f.data[key] = h
 			}
-			if _, ok := h[tok]; ok {
-				h[tok] = exp
-				renewed++
+			if _, ok := h[tok]; !ok {
+				missing = true
 			}
+			h[tok] = exp
+		}
+		if missing {
+			lost = append(lost, tok)
 		}
 	}
-	return encInt(int64(renewed))
+	return encStrArr(lost)
+}
+
+func encStrArr(vals []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "*%d\r\n", len(vals))
+	for _, v := range vals {
+		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(v), v)
+	}
+	return b.String()
 }

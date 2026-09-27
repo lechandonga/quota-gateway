@@ -121,24 +121,28 @@ if redis.call('HLEN', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
 return removed
 `
 
-// renewScript 批量续租：仅刷新仍存在的占位（HEXISTS 守卫），
-// 已过期/已释放的占位不复活，防止名额被重复计入。
-// KEYS=占位键列表；ARGV: now_ms ttl_ms token1..tokenN；返回刷新的字段数。
+// renewScript 批量续租（确保占位存在）：仍存在的占位刷新过期时间；
+// 后端记录已丢失（重启/过期）的占位按原样重建，并作为 lost 列表返回。
+// 调用方只对本地仍登记在途的 token 续租，因此重建不会复活已释放占位。
+// KEYS=占位键列表；ARGV: now_ms ttl_ms token1..tokenN；返回丢失后重建的 token 数组。
 const renewScript = `
 local now = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
-if ttl <= 0 then return 0 end
+if ttl <= 0 then return {} end
 local exp = tostring(now + ttl)
-local renewed = 0
+local lost = {}
 for i = 3, #ARGV do
+  local token = ARGV[i]
+  local missing = false
   for k = 1, #KEYS do
-    if redis.call('HEXISTS', KEYS[k], ARGV[i]) == 1 then
-      redis.call('HSET', KEYS[k], ARGV[i], exp)
-      renewed = renewed + 1
+    if redis.call('HEXISTS', KEYS[k], token) == 0 then
+      missing = true
     end
+    redis.call('HSET', KEYS[k], token, exp)
   end
+  if missing then table.insert(lost, token) end
 end
-return renewed
+return lost
 `
 
 // RedisStore 通过 Redis Lua 脚本实现跨实例原子配额。
@@ -278,13 +282,14 @@ func (s *RedisStore) Release(ctx context.Context, keys []string, token string) e
 	return nil
 }
 
-// Renew 批量续租：单次 EVAL 完成一组键上多个 token 的过期时间刷新。
-func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+// Renew 批量续租：单次 EVAL 完成一组键上多个 token 的过期时间刷新；
+// 后端记录丢失的占位按原样重建，并以 lost 返回（调用方据此前台观测）。
+func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) ([]string, error) {
 	if len(keys) == 0 || len(tokens) == 0 || ttl <= 0 {
-		return nil
+		return nil, nil
 	}
 	if err := s.ensureScripts(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	redisKeys := make([]string, 0, len(keys))
 	for _, k := range keys {
@@ -294,7 +299,7 @@ func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, 
 		redisKeys = append(redisKeys, s.cl.key(k))
 	}
 	if len(redisKeys) == 0 {
-		return nil
+		return nil, nil
 	}
 	args := make([]string, 0, len(tokens)+2)
 	args = append(args,
@@ -302,11 +307,26 @@ func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, 
 		strconv.FormatInt(ttl.Milliseconds(), 10),
 	)
 	args = append(args, tokens...)
-	_, err := s.cl.eval(ctx, s.shaRenew, renewScript, redisKeys, args)
-	if err != nil && isNoScript(err) {
-		s.markStale()
+	v, err := s.cl.eval(ctx, s.shaRenew, renewScript, redisKeys, args)
+	if err != nil {
+		if isNoScript(err) {
+			s.markStale()
+		}
+		return nil, err
 	}
-	return err
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, errRedisProto
+	}
+	var lost []string
+	for _, item := range arr {
+		tok, err := strReply(item)
+		if err != nil {
+			return nil, err
+		}
+		lost = append(lost, tok)
+	}
+	return lost, nil
 }
 
 func (s *RedisStore) markStale() {

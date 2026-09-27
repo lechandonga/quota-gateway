@@ -111,9 +111,9 @@ func (f *flakyReleaseStore) Release(ctx context.Context, keys []string, token st
 	return f.inner.Release(ctx, keys, token)
 }
 
-func (f *flakyReleaseStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+func (f *flakyReleaseStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) ([]string, error) {
 	if err := f.maybeFail(); err != nil {
-		return err
+		return nil, err
 	}
 	return f.inner.Renew(ctx, keys, tokens, ttl)
 }

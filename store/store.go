@@ -49,11 +49,17 @@ type Store interface {
 	// 重复释放与乱序释放必须无害；速率令牌不归还。
 	Release(ctx context.Context, keys []string, token string) error
 
-	// Renew 批量续租：把 keys 中仍然存在的 tokens 占位的过期时间延长到
-	// 现在+ttl。已过期或已释放的占位不得复活（防止名额被重复计入）。
-	// 用于长连接场景：只要持有方存活就持续续租，崩溃后占位在 TTL 内
-	// 有界回收。
-	Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error
+	// Renew 批量续租（确保占位存在）：把 keys 中 tokens 占位的过期时间
+	// 延长到 现在+ttl；后端记录已丢失（重启/抖动/过期）的占位按原样
+	// 重建，并以 lost 返回这些 token（用于观测“名额中途丢失”事件）。
+	//
+	// 调用方必须只对“本地仍登记为在途”的 token 续租：已释放的 token
+	// 不得再传入。管理器在释放前先摘除本地租约，释放与续租的并发交错
+	// 最多造成一个 TTL 周期内的占位残留（有界，不会泄漏）。
+	//
+	// 用于长连接场景：只要持有方存活就持续续租，请求在途多久名额都不
+	// 会被提前归还；持有方崩溃后占位在 TTL 内有界回收。
+	Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) (lost []string, err error)
 
 	// Ping 探测后端可用性。
 	Ping(ctx context.Context) error

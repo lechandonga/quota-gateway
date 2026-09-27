@@ -124,31 +124,39 @@ func (s *MemoryStore) Release(ctx context.Context, keys []string, token string) 
 	return nil
 }
 
-// Renew 批量延长占位过期时间；仅刷新仍存活（未过期、未释放）的占位，
-// 已过期/不存在的 token 不复活，避免名额被重复计入。
-func (s *MemoryStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+// Renew 批量延长占位过期时间；后端记录已丢失（未过期却被删、过期被惰性
+// 回收）的占位按原样重建，并以 lost 返回这些 token。调用方只对本地仍
+// 登记在途的 token 续租，因此重建不会复活已释放的占位（释放前调用方
+// 已摘除租约；并发交错最多残留一个 TTL 周期，有界）。
+func (s *MemoryStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) ([]string, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	if ttl <= 0 {
-		return nil // 无 TTL 的占位不过期，无需续租
+		return nil, nil // 无 TTL 的占位不过期，无需续租
 	}
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var lost []string
+	lostSet := make(map[string]struct{})
 	for _, k := range keys {
-		holders := s.conc[k]
-		if holders == nil {
+		if k == "" {
 			continue
 		}
+		holders := s.holdersLocked(k)
 		s.expireLocked(holders, now)
 		for _, tok := range tokens {
-			if _, ok := holders[tok]; ok {
-				holders[tok] = now.Add(ttl)
+			if _, ok := holders[tok]; !ok {
+				if _, seen := lostSet[tok]; !seen {
+					lostSet[tok] = struct{}{}
+					lost = append(lost, tok)
+				}
 			}
+			holders[tok] = now.Add(ttl)
 		}
 	}
-	return nil
+	return lost, nil
 }
 
 func (s *MemoryStore) Ping(ctx context.Context) error { return ctx.Err() }

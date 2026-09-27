@@ -405,7 +405,9 @@ func (f *failingStore) TryAcquire(context.Context, store.AcquireRequest) (store.
 	return store.Result{Status: store.StatusAcquired}, nil
 }
 
-func (f *failingStore) Release(context.Context, []string, string) error                { return f.err }
-func (f *failingStore) Renew(context.Context, []string, []string, time.Duration) error { return nil }
-func (f *failingStore) Ping(context.Context) error                                     { return f.err }
-func (f *failingStore) Close() error                                                   { return nil }
+func (f *failingStore) Release(context.Context, []string, string) error { return f.err }
+func (f *failingStore) Renew(context.Context, []string, []string, time.Duration) ([]string, error) {
+	return nil, nil
+}
+func (f *failingStore) Ping(context.Context) error { return f.err }
+func (f *failingStore) Close() error               { return nil }

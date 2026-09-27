@@ -28,7 +28,7 @@ func (s *toggleStore) Release(ctx context.Context, keys []string, token string) 
 	return s.inner.Release(ctx, keys, token)
 }
 
-func (s *toggleStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+func (s *toggleStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) ([]string, error) {
 	return s.inner.Renew(ctx, keys, tokens, ttl)
 }
 

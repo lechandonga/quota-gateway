@@ -12,8 +12,9 @@ import (
 //
 //   - 每次 Acquire 成功都会登记一条租约（token + 释放键 + 调用方 ctx）；
 //   - 管理器内唯一一个后台循环周期性地：
-//     a) 续租：把仍存活租约的占位过期时间延长（只要请求在途、实例存活，
-//     名额就一直被占用，不会因 TTL 到期被提前回收）；
+//     a) 续租：确保仍存活租约的占位在后端存在且不过期（只要请求在途、
+//     实例存活，名额就一直被占用；后端记录中途丢失时按原样重建并上报，
+//     不会因 TTL 到期或后端抖动被提前回收）；
 //     b) 回收：发现租约 ctx 已取消（如客户端断连而 handler 仍未返回）时，
 //     触发与正常结束完全相同的幂等释放。
 //   - 实例崩溃/强杀：续租停止，遗留占位在 ConcurrencyTTL 内有界回收。
@@ -24,7 +25,9 @@ import (
 // leaseEntry 是一条在途租约。
 type leaseEntry struct {
 	token   string
-	keys    []string // 占位键（租户并发键 + 可选共享池键）
+	tenant  string   // 观测归类（指标/日志）用
+	api     string   // 观测归类（指标/日志）用
+	keys    []string // 占位键（仅含真正写了占位的键：租户并发键 + 可选共享池键）
 	ctx     context.Context
 	release func() // 幂等释放（与调用方持有的 ReleaseFunc 相同）
 }
@@ -125,6 +128,11 @@ func (m *Manager) reapCanceledLeases() {
 
 // renewLeases 批量续租：按释放键集合分组，每组一次存储调用，
 // 调用次数与“键集合种类”同级，与连接数无关。
+//
+// 续租是“确保占位存在”语义：后端记录中途丢失（重启/抖动/过期）的
+// 名额按原样重建——只要请求仍在处理、实例还活着，名额就一直被它占着，
+// 不会被提前归还；每一次重建都记日志与指标（lease_restored），
+// 让隐性超额风险窗口可观测。
 func (m *Manager) renewLeases() {
 	entries := m.leases.snapshot()
 	if len(entries) == 0 {
@@ -132,6 +140,9 @@ func (m *Manager) renewLeases() {
 	}
 	groups := make(map[string][]*leaseEntry)
 	for _, e := range entries {
+		if len(e.keys) == 0 {
+			continue // 无后端占位的租约（降级本地兜底）：无需续租
+		}
 		k := strings.Join(e.keys, "\x00")
 		groups[k] = append(groups[k], e)
 	}
@@ -144,8 +155,10 @@ func (m *Manager) renewLeases() {
 	for _, k := range sortKeys {
 		es := groups[k]
 		tokens := make([]string, 0, len(es))
+		byToken := make(map[string]*leaseEntry, len(es))
 		for _, e := range es {
 			tokens = append(tokens, e.token)
+			byToken[e.token] = e
 		}
 		// 单次续租的存储访问 capped：后端缓慢时后台循环仍能及时
 		// 回到回收职责，避免健康租约因续租被拖而误过期。
@@ -154,13 +167,29 @@ func (m *Manager) renewLeases() {
 			timeout = releaseTimeout
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		err := m.st.Renew(ctx, es[0].keys, tokens, m.concTTL)
+		lost, err := m.st.Renew(ctx, es[0].keys, tokens, m.concTTL)
 		cancel()
 		if err != nil {
 			// 续租失败不释放本地租约：下个周期重试；若后端持续不可用，
-			// 占位最终在 TTL 到期后被后端惰性回收（有界）。
+			// 占位最终在 TTL 到期后被后端惰性回收（有界），恢复后的
+			// 首次续租会重建并上报 lost（见下）。
 			m.logger.Printf("quota: renew leases failed keys=%q tokens=%d err=%v (将在 %s 后重试)",
 				es[0].keys, len(tokens), err, m.renewInterval)
+			continue
+		}
+		if len(lost) > 0 {
+			// 名额中途丢失已重建：请求仍在处理、实例存活，名额继续被占着。
+			for _, tok := range lost {
+				e := byToken[tok]
+				if e == nil {
+					continue
+				}
+				m.logger.Printf("quota: lease slot lost in backend, restored tenant=%s api=%s token=%s (请求仍在途，名额已重建)",
+					e.tenant, e.api, tok)
+				if m.metrics != nil {
+					m.metrics.IncLeaseRestored(e.tenant, e.api, 1)
+				}
+			}
 		}
 	}
 }
