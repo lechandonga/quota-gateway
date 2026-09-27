@@ -231,12 +231,46 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 		Token:         token,
 		TTL:           m.concTTL,
 	}
+	// 本地名额预留（仅当规则配置了并发硬上限）：先本地占位再访问后端，
+	// 消除“后端已准入但本地尚未计数”的窗口——后端在该窗口内抖动进入
+	// 降级时，放行检查也不会漏掉这笔请求，本实例总在途绝不超过配置上限。
+	// 本地总数（localBackend+degInflight）已达上限时直接拒绝：此时后端
+	// 全局计数必然也已达上限，拒绝结果与后端判定一致。
+	infKey := tenant + "\x00" + api
+	reserved := false
+	if rule.MaxConcurrent > 0 {
+		m.degMu.Lock()
+		if m.localBackend[infKey]+m.degInflight[infKey] >= rule.MaxConcurrent {
+			m.degMu.Unlock()
+			m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
+			return nil, newConcurrencyLimitedError(tenant, api, m.reapInterval)
+		}
+		m.localBackend[infKey]++
+		reserved = true
+		m.degMu.Unlock()
+	}
+	releaseReservation := func() {
+		if !reserved {
+			return
+		}
+		m.degMu.Lock()
+		if m.localBackend[infKey] > 0 {
+			m.localBackend[infKey]--
+		}
+		if m.localBackend[infKey] == 0 {
+			delete(m.localBackend, infKey)
+		}
+		m.degMu.Unlock()
+		reserved = false
+	}
+
 	// 降级恢复过渡：本地降级在途不写入后端，这里从租户硬上限中扣除，
 	// 使“后端占用 + 本地降级在途”之和不超过配置上限（不放大、不重复计数）；
 	// 本地在途随请求结束自然归零后自动恢复全额。
 	if req.MaxConcurrent > 0 {
 		if n := m.degradedLocal(tenant, api); n > 0 {
 			if n >= req.MaxConcurrent {
+				releaseReservation()
 				m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
 				return nil, newConcurrencyLimitedError(tenant, api, m.reapInterval)
 			}
@@ -295,31 +329,39 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 	case admErr == nil:
 		// 成功，构造幂等释放函数。
 	case errors.Is(admErr, errRejRate):
+		releaseReservation()
 		m.recordReject(tenant, api, string(ErrCodeRateLimited))
 		return nil, newRateLimitedError(tenant, api, res.RetryAfter)
 	case errors.Is(admErr, errRejConc):
+		releaseReservation()
 		m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
 		return nil, newConcurrencyLimitedError(tenant, api, res.RetryAfter)
 	case errors.Is(admErr, errRejBackend):
-		return m.degrade(ctx, cfg, tenant, api, rule, backendCause)
+		rel, err := m.degrade(ctx, cfg, tenant, api, rule, backendCause, reserved)
+		if err != nil {
+			releaseReservation()
+			return nil, err
+		}
+		reserved = false // 预留已转换为降级本地在途（见 degradeAllow）
+		return rel, nil
 	case errors.Is(admErr, context.DeadlineExceeded) && ctx.Err() == nil:
 		// 公平排队超过 QueueTimeout（调用方自身 ctx 未到期）。
+		releaseReservation()
 		m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
 		return nil, newConcurrencyLimitedError(tenant, api, m.queueTimeout)
 	default:
 		// 调用方 ctx 取消/超时（含客户端主动断连）：未占位，直接返回。
+		releaseReservation()
 		return nil, admErr
 	}
 
 	if m.metrics != nil {
 		m.metrics.IncAllowed(tenant, api)
 	}
-	// 本实例“后端计账在途”+1：降级放行时与本地降级在途合并判定上限，
-	// 保证故障前在途 + 放行新进之和也不超过配置上限。
-	infKey := tenant + "\x00" + api
-	m.degMu.Lock()
-	m.localBackend[infKey]++
-	m.degMu.Unlock()
+	// 本地预留（若启用）即本实例“后端计账在途”计数，随释放回滚；
+	// 降级放行时与本地降级在途合并判定上限。
+	localCounted := reserved
+	reserved = false // 所有权移交给 release 闭包
 	// 登记在途租约：后台循环负责续租（长连接名额不被提前回收）与
 	// ctx 取消回收（客户端断连但 handler 未返回时名额有界释放）。
 	entry := &leaseEntry{token: token, tenant: tenant, api: api, keys: releaseKeys, ctx: ctx}
@@ -327,14 +369,16 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 	release := func() {
 		once.Do(func() {
 			m.leases.remove(token)
-			m.degMu.Lock()
-			if m.localBackend[infKey] > 0 {
-				m.localBackend[infKey]--
+			if localCounted {
+				m.degMu.Lock()
+				if m.localBackend[infKey] > 0 {
+					m.localBackend[infKey]--
+				}
+				if m.localBackend[infKey] == 0 {
+					delete(m.localBackend, infKey)
+				}
+				m.degMu.Unlock()
 			}
-			if m.localBackend[infKey] == 0 {
-				delete(m.localBackend, infKey)
-			}
-			m.degMu.Unlock()
 			// 独立 context：请求结束（含客户端中断）也必须尽力释放，
 			// 防止长连接异常路径造成并发占用泄漏。
 			rctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
@@ -360,14 +404,15 @@ func (m *Manager) Acquire(ctx context.Context, tenant, api string) (ReleaseFunc,
 }
 
 // degrade 按配置处理后端不可用：Deny 返回可解释错误；Allow 走本地兜底放行。
-func (m *Manager) degrade(ctx context.Context, cfg *Config, tenant, api string, rule Rule, cause error) (ReleaseFunc, error) {
+// reserved 表示本次获取已持有本地预留名额（规则配置了并发硬上限时）。
+func (m *Manager) degrade(ctx context.Context, cfg *Config, tenant, api string, rule Rule, cause error, reserved bool) (ReleaseFunc, error) {
 	m.logger.Printf("quota: backend unavailable tenant=%s api=%s policy=%s err=%v",
 		tenant, api, cfg.Degrade, cause)
 	if m.metrics != nil {
 		m.metrics.SetStoreHealthy(false)
 	}
 	if cfg.Degrade == DegradeAllow {
-		return m.degradeAllow(ctx, tenant, api, rule)
+		return m.degradeAllow(ctx, tenant, api, rule, reserved)
 	}
 	if m.metrics != nil {
 		m.metrics.IncDegraded(tenant, api, DegradeDeny.String())
@@ -381,34 +426,50 @@ func (m *Manager) degrade(ctx context.Context, cfg *Config, tenant, api string, 
 // 本地回收、可观测；达到本地上限时按并发超限拒绝（可解释、带重试提示）。
 //
 // 上限判定是合并口径：本实例“故障前经后端正常计账、仍在运行的在途”
-// （localBackend）也算入——后端短暂不可用期间这些请求的后端名额仍然
-// 有效，若只算本地降级在途，两批合计可达上限两倍。合并判定保证本实例
-// 上该租户同时运行的请求数绝不超过配置上限。
+// （localBackend，含已预留名额）也算入——后端短暂不可用期间这些请求的
+// 后端名额仍然有效，若只算本地降级在途，两批合计可达上限两倍。合并判定
+// 保证本实例上该租户同时运行的请求数绝不超过配置上限。
+//
+// reserved=true 时本次获取在进入降级前已持有本地预留名额（预留时已通过
+// 合并上限判定），这里把预留从“后端在途”转换为“降级在途”，本地总数
+// 不变，无需再次判定。
 //
 // 恢复语义：降级期间的在途请求始终只计在本地，从不写入后端，因此后端
 // 恢复后不会被重复计数；同时正常获取路径会把本地在途数从租户硬上限中
 // 扣除，使“后端占用 + 本地降级在途”之和始终不超过配置上限（不放大额度），
 // 本地在途随请求结束自然归零后恢复全额。
-func (m *Manager) degradeAllow(ctx context.Context, tenant, api string, rule Rule) (ReleaseFunc, error) {
-	limit := rule.MaxConcurrent
-	if limit <= 0 {
-		limit = m.degradeMax
-	}
+func (m *Manager) degradeAllow(ctx context.Context, tenant, api string, rule Rule, reserved bool) (ReleaseFunc, error) {
 	key := tenant + "\x00" + api
 	m.degMu.Lock()
-	backend, degraded := m.localBackend[key], m.degInflight[key]
-	if limit > 0 && backend+degraded >= limit {
-		m.degMu.Unlock()
-		m.logger.Printf("quota: degrade allow but local cap reached tenant=%s api=%s inflight=%d (backend=%d degraded=%d) cap=%d",
-			tenant, api, backend+degraded, backend, degraded, limit)
-		if m.metrics != nil {
-			m.metrics.IncDegraded(tenant, api, "local_limited")
+	if reserved {
+		// 预留名额转换：后端在途 → 降级在途，本地总数不变。
+		if m.localBackend[key] > 0 {
+			m.localBackend[key]--
 		}
-		m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
-		return nil, newConcurrencyLimitedError(tenant, api, m.reapInterval)
+		if m.localBackend[key] == 0 {
+			delete(m.localBackend, key)
+		}
+		m.degInflight[key]++
+		m.degMu.Unlock()
+	} else {
+		limit := rule.MaxConcurrent
+		if limit <= 0 {
+			limit = m.degradeMax
+		}
+		backend, degraded := m.localBackend[key], m.degInflight[key]
+		if limit > 0 && backend+degraded >= limit {
+			m.degMu.Unlock()
+			m.logger.Printf("quota: degrade allow but local cap reached tenant=%s api=%s inflight=%d (backend=%d degraded=%d) cap=%d",
+				tenant, api, backend+degraded, backend, degraded, limit)
+			if m.metrics != nil {
+				m.metrics.IncDegraded(tenant, api, "local_limited")
+			}
+			m.recordReject(tenant, api, string(ErrCodeConcurrencyLimited))
+			return nil, newConcurrencyLimitedError(tenant, api, m.reapInterval)
+		}
+		m.degInflight[key] = degraded + 1
+		m.degMu.Unlock()
 	}
-	m.degInflight[key] = degraded + 1
-	m.degMu.Unlock()
 
 	if m.metrics != nil {
 		m.metrics.IncDegraded(tenant, api, DegradeAllow.String())

@@ -61,27 +61,51 @@ func TestLease_LongConnectionKeepsSlotBeyondTTL(t *testing.T) {
 }
 
 // 持有方崩溃（不再续租、也不释放）后，名额必须在 TTL 量级内有界回收，
-// 且回收前不得放大额度。
+// 且回收前不得放大额度。崩溃用“停止实例 A 的后台循环”模拟（进程死亡：
+// 本地状态随进程消失，后端只剩遗留占位）；新请求由实例 B（同一后端）发起。
 func TestLease_CrashRecoversSlotWithinBoundedTime(t *testing.T) {
 	ttl := 150 * time.Millisecond
-	// RenewInterval 极大：模拟持有实例崩溃（不再续租）。
-	m, ms := newLeaseManager(t, longConnConfig(), ttl, time.Hour)
+	ms := store.NewMemoryStore()
+	cfg := longConnConfig()
 	ctx := context.Background()
 
-	rel, err := m.Acquire(ctx, "t1", "/long")
+	ma, err := NewManager(Options{
+		Store: ms, Config: cfg,
+		ConcurrencyTTL: ttl, RenewInterval: 40 * time.Millisecond,
+		ReapInterval: 20 * time.Millisecond, QueueTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewManager A: %v", err)
+	}
+	rel, err := ma.Acquire(ctx, "t1", "/long")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	_ = rel // 故意不释放：模拟崩溃遗留的占位。
+	_ = rel // 故意不释放：崩溃实例遗留的占位。
+	// 模拟进程崩溃：后台循环停止（不再续租），本地状态随进程消失；
+	// 注意不调用 ma.Close()——那会关闭共享后端，不符合崩溃语义。
+	close(ma.loopStop)
+	ma.loopWg.Wait()
+
+	// 实例 B：同一后端、全新本地状态。
+	mb, err := NewManager(Options{
+		Store: ms, Config: cfg,
+		ConcurrencyTTL: ttl, RenewInterval: 40 * time.Millisecond,
+		ReapInterval: 20 * time.Millisecond, QueueTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewManager B: %v", err)
+	}
+	t.Cleanup(func() { _ = mb.Close() })
 
 	// TTL 到期前：名额仍被占用，不得放大。
-	if _, err := m.Acquire(ctx, "t1", "/long"); err == nil {
+	if _, err := mb.Acquire(ctx, "t1", "/long"); err == nil {
 		t.Fatal("slot must still be held before TTL expiry")
 	}
 	// 有界回收：TTL 之后新请求可以进入。
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		rel2, err := m.Acquire(ctx, "t1", "/long")
+		rel2, err := mb.Acquire(ctx, "t1", "/long")
 		if err == nil {
 			rel2()
 			break
