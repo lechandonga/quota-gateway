@@ -170,35 +170,34 @@ func TestDegradeAllow_ConcurrentFlappingNeverExceedsCap(t *testing.T) {
 		go func(seed int) {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				ctx, cancel := context.WithCancel(context.Background())
-				rel, err := m.Acquire(ctx, "tflap", "/work")
-				if err != nil {
-					cancel()
-					continue
-				}
-				// 采样本实例总在途：任何时刻都不得超过配置上限。
-				backend, degraded := m.LocalInflight("tflap", "/work")
-				total := backend + degraded
-				for { // 记录观测到的最大值
-					old := maxObserved.Load()
-					if total <= old || maxObserved.CompareAndSwap(old, total) {
-						break
+				func() {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					rel, err := m.Acquire(ctx, "tflap", "/work")
+					if err != nil {
+						return
 					}
-				}
-				switch (seed + i) % 4 {
-				case 0: // 正常结束
-					rel()
-					cancel()
-				case 1: // 重复释放
-					rel()
-					rel()
-					cancel()
-				case 2: // 断连后释放
-					cancel()
-					rel()
-				case 3: // 仅断连：交后台回收
-					cancel()
-				}
+					// 采样本实例总在途：任何时刻都不得超过配置上限。
+					backend, degraded := m.LocalInflight("tflap", "/work")
+					total := backend + degraded
+					for { // 记录观测到的最大值
+						old := maxObserved.Load()
+						if total <= old || maxObserved.CompareAndSwap(old, total) {
+							break
+						}
+					}
+					switch (seed + i) % 4 {
+					case 0: // 正常结束
+						rel()
+					case 1: // 重复释放
+						rel()
+						rel()
+					case 2: // 断连后释放
+						cancel()
+						rel()
+					case 3: // 仅断连（defer 取消 ctx）：交后台回收
+					}
+				}()
 			}
 		}(g)
 	}
