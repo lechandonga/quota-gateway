@@ -213,6 +213,8 @@ func (f *fakeRedis) eval(args []string) string {
 		return f.runRelease(keys, argv)
 	case renewScript:
 		return f.runRenew(keys, argv)
+	case reclaimScript:
+		return f.runReclaim(keys, argv)
 	default:
 		return encErr("ERR unknown script")
 	}
@@ -363,27 +365,83 @@ func (f *fakeRedis) runRelease(keys, argv []string) string {
 	return encInt(int64(removed))
 }
 
-// runRenew 与 renewScript 等价的 Go 实现：仅刷新仍存在的占位。
+// runRenew 与 renewScript 等价的 Go 实现：仅刷新仍存在的占位，
+// 并返回 {刷新字段数, 缺失token...}（任一占位键上缺失即计入）。
 func (f *fakeRedis) runRenew(keys, argv []string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	ttl, _ := strconv.ParseInt(argv[1], 10, 64)
-	if ttl <= 0 {
-		return encInt(0)
-	}
-	exp := strconv.FormatInt(time.Now().UnixMilli()+ttl, 10)
 	renewed := 0
-	for _, tok := range argv[2:] {
-		for _, key := range keys {
-			h := f.data[key]
-			if h == nil {
-				continue
+	var missing []string
+	if ttl > 0 {
+		exp := strconv.FormatInt(time.Now().UnixMilli()+ttl, 10)
+		for _, tok := range argv[2:] {
+			lost := false
+			for _, key := range keys {
+				h := f.data[key]
+				if h == nil {
+					lost = true
+					continue
+				}
+				if _, ok := h[tok]; ok {
+					h[tok] = exp
+					renewed++
+				} else {
+					lost = true
+				}
 			}
-			if _, ok := h[tok]; ok {
-				h[tok] = exp
-				renewed++
+			if lost {
+				missing = append(missing, tok)
 			}
 		}
 	}
-	return encInt(int64(renewed))
+	vals := make([]string, 0, len(missing)+1)
+	vals = append(vals, strconv.FormatInt(int64(renewed), 10))
+	vals = append(vals, missing...)
+	return encArr(vals)
+}
+
+// runReclaim 与 reclaimScript 等价的 Go 实现：不扣速率令牌，
+// 惰性清理过期占位后按租户/共享上限判定，任一键满则整体不写入。
+func (f *fakeRedis) runReclaim(keys, argv []string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ck, sk := keys[0], keys[1]
+	now := time.Now().UnixMilli()
+	maxT, _ := strconv.ParseInt(argv[1], 10, 64)
+	maxS, _ := strconv.ParseInt(argv[2], 10, 64)
+	token := argv[3]
+	ttl, _ := strconv.ParseInt(argv[4], 10, 64)
+
+	count := func(key string) int64 {
+		h := f.data[key]
+		var c int64
+		for k, v := range h {
+			exp, _ := strconv.ParseInt(v, 10, 64)
+			if exp > 0 && exp <= now {
+				delete(h, k)
+				continue
+			}
+			c++
+		}
+		return c
+	}
+
+	if ck != "_" && maxT > 0 && count(ck) >= maxT {
+		return encInt(2)
+	}
+	if sk != "_" && maxS > 0 && count(sk) >= maxS {
+		return encInt(3)
+	}
+	exp := int64(0)
+	if ttl > 0 {
+		exp = now + ttl
+	}
+	if ck != "_" {
+		put(f.data, ck, token, exp)
+	}
+	if sk != "_" && maxS > 0 {
+		put(f.data, sk, token, exp)
+	}
+	return encInt(0)
 }

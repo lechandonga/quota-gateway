@@ -111,11 +111,15 @@ func (f *flakyReleaseStore) Release(ctx context.Context, keys []string, token st
 	return f.inner.Release(ctx, keys, token)
 }
 
-func (f *flakyReleaseStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+func (f *flakyReleaseStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) ([]string, error) {
 	if err := f.maybeFail(); err != nil {
-		return err
+		return nil, err
 	}
 	return f.inner.Renew(ctx, keys, tokens, ttl)
+}
+
+func (f *flakyReleaseStore) Reclaim(ctx context.Context, req store.ReclaimRequest) (store.Status, error) {
+	return f.inner.Reclaim(ctx, req)
 }
 
 func (f *flakyReleaseStore) Ping(ctx context.Context) error { return f.inner.Ping(ctx) }

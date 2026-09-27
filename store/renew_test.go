@@ -22,7 +22,7 @@ func TestMemoryStore_RenewKeepsLongConnectionSlot(t *testing.T) {
 	// 请求持续 5 倍 TTL，期间按周期续租。
 	for i := 0; i < 5; i++ {
 		clock = clock.Add(80 * time.Millisecond)
-		if err := ms.Renew(ctx, []string{"c"}, []string{"a"}, ttl); err != nil {
+		if _, err := ms.Renew(ctx, []string{"c"}, []string{"a"}, ttl); err != nil {
 			t.Fatalf("renew %d: %v", i, err)
 		}
 		if got := ms.Inflight("c"); got != 1 {
@@ -52,7 +52,7 @@ func TestMemoryStore_RenewDoesNotResurrect(t *testing.T) {
 	if err := ms.Release(ctx, []string{"c"}, "a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := ms.Renew(ctx, []string{"c"}, []string{"a"}, ttl); err != nil {
+	if _, err := ms.Renew(ctx, []string{"c"}, []string{"a"}, ttl); err != nil {
 		t.Fatal(err)
 	}
 	if got := ms.Inflight("c"); got != 0 {
@@ -64,7 +64,7 @@ func TestMemoryStore_RenewDoesNotResurrect(t *testing.T) {
 		t.Fatalf("re-acquire: %+v", r)
 	}
 	clock = clock.Add(2 * ttl) // b 过期
-	if err := ms.Renew(ctx, []string{"c"}, []string{"b"}, ttl); err != nil {
+	if _, err := ms.Renew(ctx, []string{"c"}, []string{"b"}, ttl); err != nil {
 		t.Fatal(err)
 	}
 	if got := ms.Inflight("c"); got != 0 {
@@ -90,7 +90,7 @@ func TestRedisStore_RenewSemantics(t *testing.T) {
 	// 持续 4 倍 TTL，期间续租：名额必须一直被占用。
 	for i := 0; i < 4; i++ {
 		time.Sleep(80 * time.Millisecond)
-		if err := st.Renew(ctx, []string{"cc"}, []string{"a"}, ttl); err != nil {
+		if _, err := st.Renew(ctx, []string{"cc"}, []string{"a"}, ttl); err != nil {
 			t.Fatalf("renew %d: %v", i, err)
 		}
 		r2, _ := st.TryAcquire(ctx, AcquireRequest{
@@ -105,7 +105,7 @@ func TestRedisStore_RenewSemantics(t *testing.T) {
 	if err := st.Release(ctx, []string{"cc"}, "a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Renew(ctx, []string{"cc"}, []string{"a"}, ttl); err != nil {
+	if _, err := st.Renew(ctx, []string{"cc"}, []string{"a"}, ttl); err != nil {
 		t.Fatal(err)
 	}
 	r3, _ := st.TryAcquire(ctx, AcquireRequest{
@@ -139,7 +139,7 @@ func TestRedisStore_RenewMultiInstanceCrashRecovery(t *testing.T) {
 	// A 存活并续租 3 轮：B 不得进入。
 	for i := 0; i < 3; i++ {
 		time.Sleep(90 * time.Millisecond)
-		if err := a.Renew(ctx, []string{"cc"}, []string{"inst-a-1"}, ttl); err != nil {
+		if _, err := a.Renew(ctx, []string{"cc"}, []string{"inst-a-1"}, ttl); err != nil {
 			t.Fatalf("A renew %d: %v", i, err)
 		}
 		rb, _ := b.TryAcquire(ctx, mkReq("inst-b-1"))

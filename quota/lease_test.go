@@ -61,27 +61,41 @@ func TestLease_LongConnectionKeepsSlotBeyondTTL(t *testing.T) {
 }
 
 // 持有方崩溃（不再续租、也不释放）后，名额必须在 TTL 量级内有界回收，
-// 且回收前不得放大额度。
+// 且回收前不得放大额度。这里用两个 Manager 共享同一后端：A 崩溃后其
+// 本地在途状态随之消失，仅后端占位（带 TTL）留存，由存活的 B 观察回收。
 func TestLease_CrashRecoversSlotWithinBoundedTime(t *testing.T) {
 	ttl := 150 * time.Millisecond
 	// RenewInterval 极大：模拟持有实例崩溃（不再续租）。
-	m, ms := newLeaseManager(t, longConnConfig(), ttl, time.Hour)
+	ms := store.NewMemoryStore()
+	newM := func() *Manager {
+		mm, err := NewManager(Options{
+			Store: ms, Config: longConnConfig(),
+			ConcurrencyTTL: ttl, RenewInterval: time.Hour,
+			ReapInterval: 20 * time.Millisecond, QueueTimeout: 200 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewManager: %v", err)
+		}
+		t.Cleanup(func() { _ = mm.Close() })
+		return mm
+	}
+	a, b := newM(), newM()
 	ctx := context.Background()
 
-	rel, err := m.Acquire(ctx, "t1", "/long")
+	rel, err := a.Acquire(ctx, "t1", "/long")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	_ = rel // 故意不释放：模拟崩溃遗留的占位。
+	_ = rel // 故意不释放：模拟 A 崩溃遗留的占位。
 
-	// TTL 到期前：名额仍被占用，不得放大。
-	if _, err := m.Acquire(ctx, "t1", "/long"); err == nil {
+	// TTL 到期前：B 视角名额仍被占用，不得放大。
+	if _, err := b.Acquire(ctx, "t1", "/long"); err == nil {
 		t.Fatal("slot must still be held before TTL expiry")
 	}
-	// 有界回收：TTL 之后新请求可以进入。
+	// 有界回收：TTL 之后 B 可以进入（A 的本地状态与 B 无关）。
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		rel2, err := m.Acquire(ctx, "t1", "/long")
+		rel2, err := b.Acquire(ctx, "t1", "/long")
 		if err == nil {
 			rel2()
 			break

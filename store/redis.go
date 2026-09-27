@@ -123,22 +123,73 @@ return removed
 
 // renewScript 批量续租：仅刷新仍存在的占位（HEXISTS 守卫），
 // 已过期/已释放的占位不复活，防止名额被重复计入。
-// KEYS=占位键列表；ARGV: now_ms ttl_ms token1..tokenN；返回刷新的字段数。
+// KEYS=占位键列表；ARGV: now_ms ttl_ms token1..tokenN；
+// 返回数组：{刷新的字段数, 缺失token1, 缺失token2, ...}。
+// 缺失判定：token 在任一 KEYS 上不存在即为缺失（可能是正常释放与续租
+// 并发交错，也可能是后端记录中途丢失；由调用方按本地租约状态区分）。
 const renewScript = `
 local now = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
-if ttl <= 0 then return 0 end
-local exp = tostring(now + ttl)
 local renewed = 0
-for i = 3, #ARGV do
-  for k = 1, #KEYS do
-    if redis.call('HEXISTS', KEYS[k], ARGV[i]) == 1 then
-      redis.call('HSET', KEYS[k], ARGV[i], exp)
-      renewed = renewed + 1
+local missing = {}
+if ttl > 0 then
+  local exp = tostring(now + ttl)
+  for i = 3, #ARGV do
+    local tok = ARGV[i]
+    local lost = false
+    for k = 1, #KEYS do
+      if redis.call('HEXISTS', KEYS[k], tok) == 1 then
+        redis.call('HSET', KEYS[k], tok, exp)
+        renewed = renewed + 1
+      else
+        lost = true
+      end
     end
+    if lost then table.insert(missing, tok) end
   end
 end
-return renewed
+return {renewed, unpack(missing)}
+`
+
+// reclaimScript 在“持有方存活但后端记录丢失”时按当前上限原子补占：
+// 不触碰速率令牌；先检查所有启用键的有效占位数（惰性清理过期占位），
+// 任一键达到上限则整体不写入并返回受限状态；全部有空位时写入同一个
+// token，保证补占后总数严格不超过上限（不放大额度）。
+// KEYS[1]=租户并发键（"_" 表示该规则不设租户上限，仅受共享池约束）；
+// KEYS[2]=共享容量键（"_" 表示不启用）。
+// ARGV: now_ms max_tenant max_shared token ttl_ms
+// 返回 0=已补占（或 token 本就在）、2=租户上限、3=共享池上限。
+const reclaimScript = `
+local ck, sk = KEYS[1], KEYS[2]
+local now = tonumber(ARGV[1])
+local maxt = tonumber(ARGV[2])
+local maxs = tonumber(ARGV[3])
+local token = ARGV[4]
+local ttl = tonumber(ARGV[5])
+
+local function count_alive(key)
+  local holders = redis.call('HGETALL', key)
+  local count = 0
+  for i = 1, #holders, 2 do
+    local exp = tonumber(holders[i+1])
+    if exp > 0 and exp <= now then
+      redis.call('HDEL', key, holders[i])
+    else
+      count = count + 1
+    end
+  end
+  return count
+end
+
+if ck ~= '_' and maxt > 0 and count_alive(ck) >= maxt then return 2 end
+if sk ~= '_' and maxs > 0 and count_alive(sk) >= maxs then return 3 end
+local exp = 0
+if ttl > 0 then exp = now + ttl end
+if ck ~= '_' then redis.call('HSET', ck, token, tostring(exp)) end
+if sk ~= '_' and maxs > 0 then
+  redis.call('HSET', sk, token, tostring(exp))
+end
+return 0
 `
 
 // RedisStore 通过 Redis Lua 脚本实现跨实例原子配额。
@@ -151,6 +202,7 @@ type RedisStore struct {
 	shaTry      string
 	shaRelease  string
 	shaRenew    string
+	shaReclaim  string
 	scriptMu    sync.Mutex
 	loaded      bool
 	dialTimeout time.Duration
@@ -202,7 +254,15 @@ func (s *RedisStore) ensureScripts(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.shaTry, s.shaRelease, s.shaRenew, s.loaded = sha1, sha2, sha3, true
+	v, err = s.cl.do(ctx, "SCRIPT", "LOAD", reclaimScript)
+	if err != nil {
+		return err
+	}
+	sha4, err := strReply(v)
+	if err != nil {
+		return err
+	}
+	s.shaTry, s.shaRelease, s.shaRenew, s.shaReclaim, s.loaded = sha1, sha2, sha3, sha4, true
 	return nil
 }
 
@@ -278,13 +338,14 @@ func (s *RedisStore) Release(ctx context.Context, keys []string, token string) e
 	return nil
 }
 
-// Renew 批量续租：单次 EVAL 完成一组键上多个 token 的过期时间刷新。
-func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+// Renew 批量续租：单次 EVAL 完成一组键上多个 token 的过期时间刷新，
+// 并返回在任一占位键上已不存在的 token 列表（供丢失感知与补占）。
+func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) ([]string, error) {
 	if len(keys) == 0 || len(tokens) == 0 || ttl <= 0 {
-		return nil
+		return nil, nil
 	}
 	if err := s.ensureScripts(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	redisKeys := make([]string, 0, len(keys))
 	for _, k := range keys {
@@ -294,7 +355,7 @@ func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, 
 		redisKeys = append(redisKeys, s.cl.key(k))
 	}
 	if len(redisKeys) == 0 {
-		return nil
+		return nil, nil
 	}
 	args := make([]string, 0, len(tokens)+2)
 	args = append(args,
@@ -302,11 +363,68 @@ func (s *RedisStore) Renew(ctx context.Context, keys []string, tokens []string, 
 		strconv.FormatInt(ttl.Milliseconds(), 10),
 	)
 	args = append(args, tokens...)
-	_, err := s.cl.eval(ctx, s.shaRenew, renewScript, redisKeys, args)
-	if err != nil && isNoScript(err) {
-		s.markStale()
+	v, err := s.cl.eval(ctx, s.shaRenew, renewScript, redisKeys, args)
+	if err != nil {
+		if isNoScript(err) {
+			s.markStale()
+		}
+		return nil, err
 	}
-	return err
+	arr, ok := v.([]any)
+	if !ok || len(arr) == 0 {
+		return nil, errRedisProto
+	}
+	missing := make([]string, 0, len(arr)-1)
+	for _, item := range arr[1:] {
+		tok, err := strReply(item)
+		if err != nil {
+			return nil, err
+		}
+		missing = append(missing, tok)
+	}
+	return missing, nil
+}
+
+// Reclaim 以一段原子 Lua 脚本按当前上限补占丢失的 token（不扣速率令牌）。
+func (s *RedisStore) Reclaim(ctx context.Context, req ReclaimRequest) (Status, error) {
+	if err := s.ensureScripts(ctx); err != nil {
+		return 0, err
+	}
+	redisConcKey := "_"
+	if req.ConcKey != "" && req.MaxConcurrent > 0 {
+		redisConcKey = s.cl.key(req.ConcKey)
+	}
+	redisSharedKey := "_"
+	if req.SharedKey != "" && req.MaxShared > 0 {
+		redisSharedKey = s.cl.key(req.SharedKey)
+	}
+	args := []string{
+		strconv.FormatInt(time.Now().UnixMilli(), 10),
+		strconv.FormatInt(req.MaxConcurrent, 10),
+		strconv.FormatInt(req.MaxShared, 10),
+		req.Token,
+		strconv.FormatInt(req.TTL.Milliseconds(), 10),
+	}
+	v, err := s.cl.eval(ctx, s.shaReclaim, reclaimScript,
+		[]string{redisConcKey, redisSharedKey}, args)
+	if err != nil {
+		if isNoScript(err) {
+			s.markStale()
+		}
+		return 0, err
+	}
+	code, err := atoiReply(v)
+	if err != nil {
+		return 0, err
+	}
+	switch code {
+	case 0:
+		return StatusAcquired, nil
+	case 2:
+		return StatusConcurrencyLimited, nil
+	default:
+		return StatusSharedLimited, nil
+	}
 }
 
 func (s *RedisStore) markStale() {

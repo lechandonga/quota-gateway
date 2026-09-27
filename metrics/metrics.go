@@ -24,14 +24,23 @@ type Recorder struct {
 	inflight map[string]*atomic.Int64
 	// degradedInflight 是降级放行期间本地兜底的在途计数（未占用后端额度）。
 	degradedInflight map[string]*atomic.Int64
+	// leaseLost 是续租时发现后端名额记录中途丢失（请求仍在途）的次数。
+	leaseLost map[string]*atomic.Int64 // key: tenant|api
+	// leaseReclaimed 是丢失名额在不超上限前提下成功补占的次数。
+	leaseReclaimed map[string]*atomic.Int64
+	// leaseReclaimBlocked 是补占因租户/共享上限已满而顺延到下周期的次数。
+	leaseReclaimBlocked map[string]*atomic.Int64
 
 	storeHealthy atomic.Bool
 	configVer    atomic.Value // string
 
-	requestsTotal atomic.Int64
-	allowedTotal  atomic.Int64
-	rejectTotal   atomic.Int64
-	degradeTotal  atomic.Int64
+	requestsTotal       atomic.Int64
+	allowedTotal        atomic.Int64
+	rejectTotal         atomic.Int64
+	degradeTotal        atomic.Int64
+	leaseLostTotal      atomic.Int64
+	leaseReclaimedTotal atomic.Int64
+	leaseBlockedTotal   atomic.Int64
 }
 
 type latencyStats struct {
@@ -54,19 +63,46 @@ func New() *Recorder {
 		return defaultRecorder
 	}
 	r := &Recorder{
-		startTime:        time.Now(),
-		requests:         make(map[string]*atomic.Int64),
-		allowed:          make(map[string]*atomic.Int64),
-		rejected:         make(map[string]*atomic.Int64),
-		degraded:         make(map[string]*atomic.Int64),
-		latency:          make(map[string]*latencyStats),
-		inflight:         make(map[string]*atomic.Int64),
-		degradedInflight: make(map[string]*atomic.Int64),
+		startTime:           time.Now(),
+		requests:            make(map[string]*atomic.Int64),
+		allowed:             make(map[string]*atomic.Int64),
+		rejected:            make(map[string]*atomic.Int64),
+		degraded:            make(map[string]*atomic.Int64),
+		latency:             make(map[string]*latencyStats),
+		inflight:            make(map[string]*atomic.Int64),
+		degradedInflight:    make(map[string]*atomic.Int64),
+		leaseLost:           make(map[string]*atomic.Int64),
+		leaseReclaimed:      make(map[string]*atomic.Int64),
+		leaseReclaimBlocked: make(map[string]*atomic.Int64),
 	}
 	r.storeHealthy.Store(true)
 	r.configVer.Store("")
 	defaultRecorder = r
 	return r
+}
+
+// ResetForTest 清空所有聚合计数与在途表（仅供测试：New 返回进程内默认
+// 单例，-count=N 重复运行时需要重置到干净状态）。
+func (r *Recorder) ResetForTest() {
+	r.mu.Lock()
+	r.requests = make(map[string]*atomic.Int64)
+	r.allowed = make(map[string]*atomic.Int64)
+	r.rejected = make(map[string]*atomic.Int64)
+	r.degraded = make(map[string]*atomic.Int64)
+	r.latency = make(map[string]*latencyStats)
+	r.inflight = make(map[string]*atomic.Int64)
+	r.degradedInflight = make(map[string]*atomic.Int64)
+	r.leaseLost = make(map[string]*atomic.Int64)
+	r.leaseReclaimed = make(map[string]*atomic.Int64)
+	r.leaseReclaimBlocked = make(map[string]*atomic.Int64)
+	r.mu.Unlock()
+	r.requestsTotal.Store(0)
+	r.allowedTotal.Store(0)
+	r.rejectTotal.Store(0)
+	r.degradeTotal.Store(0)
+	r.leaseLostTotal.Store(0)
+	r.leaseReclaimedTotal.Store(0)
+	r.leaseBlockedTotal.Store(0)
 }
 
 func mkKey(parts ...string) string { return strings.Join(parts, "|") }
@@ -153,6 +189,24 @@ func (r *Recorder) DecDegradedInflight(tenant, api string) {
 	counter(r.degradedInflight, &r.mu, mkKey(tenant, api)).Add(-1)
 }
 
+// IncLeaseLost 记录一次“在途租约的后端名额记录中途丢失”事件。
+func (r *Recorder) IncLeaseLost(tenant, api string) {
+	counter(r.leaseLost, &r.mu, mkKey(tenant, api)).Add(1)
+	r.leaseLostTotal.Add(1)
+}
+
+// IncLeaseReclaimed 记录一次丢失名额的成功补占（未放大额度）。
+func (r *Recorder) IncLeaseReclaimed(tenant, api string) {
+	counter(r.leaseReclaimed, &r.mu, mkKey(tenant, api)).Add(1)
+	r.leaseReclaimedTotal.Add(1)
+}
+
+// IncLeaseReclaimBlocked 记录一次补占因上限已满顺延到下个周期。
+func (r *Recorder) IncLeaseReclaimBlocked(tenant, api string) {
+	counter(r.leaseReclaimBlocked, &r.mu, mkKey(tenant, api)).Add(1)
+	r.leaseBlockedTotal.Add(1)
+}
+
 func (r *Recorder) SetStoreHealthy(healthy bool) { r.storeHealthy.Store(healthy) }
 
 func (r *Recorder) SetConfigVersion(version string) { r.configVer.Store(version) }
@@ -164,13 +218,16 @@ func (r *Recorder) IncConfigRejected(version string) {
 // Snapshot 返回指标快照，用于日志、测试或自定义导出。
 func (r *Recorder) Snapshot() map[string]any {
 	snap := map[string]any{
-		"uptime_seconds": int64(time.Since(r.startTime).Seconds()),
-		"requests_total": r.requestsTotal.Load(),
-		"allowed_total":  r.allowedTotal.Load(),
-		"rejected_total": r.rejectTotal.Load(),
-		"degraded_total": r.degradeTotal.Load(),
-		"store_healthy":  r.storeHealthy.Load(),
-		"config_version": r.configVer.Load(),
+		"uptime_seconds":              int64(time.Since(r.startTime).Seconds()),
+		"requests_total":              r.requestsTotal.Load(),
+		"allowed_total":               r.allowedTotal.Load(),
+		"rejected_total":              r.rejectTotal.Load(),
+		"degraded_total":              r.degradeTotal.Load(),
+		"lease_lost_total":            r.leaseLostTotal.Load(),
+		"lease_reclaimed_total":       r.leaseReclaimedTotal.Load(),
+		"lease_reclaim_blocked_total": r.leaseBlockedTotal.Load(),
+		"store_healthy":               r.storeHealthy.Load(),
+		"config_version":              r.configVer.Load(),
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -187,6 +244,9 @@ func (r *Recorder) Snapshot() map[string]any {
 	snap["degraded_by_key"] = add("degraded", r.degraded)
 	snap["inflight_by_key"] = add("inflight", r.inflight)
 	snap["degraded_inflight_by_key"] = add("degraded_inflight", r.degradedInflight)
+	snap["lease_lost_by_key"] = add("lease_lost", r.leaseLost)
+	snap["lease_reclaimed_by_key"] = add("lease_reclaimed", r.leaseReclaimed)
+	snap["lease_reclaim_blocked_by_key"] = add("lease_reclaim_blocked", r.leaseReclaimBlocked)
 	lat := make(map[string]map[string]int64, len(r.latency))
 	keys := make([]string, 0, len(r.latency))
 	for k := range r.latency {

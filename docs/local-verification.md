@@ -24,12 +24,17 @@ CGO_ENABLED=1 go test -race -count=1 ./...
 go test -count=1 ./quota/   -run TestAcquire
 go test -count=1 ./quota/   -run TestLease_
 go test -count=1 ./quota/   -run TestDegradeAllow_
+go test -count=1 ./quota/   -run TestReclaim_
+go test -count=1 ./store/   -run 'TestMemoryStore_Reclaim|TestRedisStore_RenewReclaim'
 go test -count=1 ./store/   -run TestRedisStore_MultiInstanceConsistency
 go test -count=1 ./middleware/ -run TestMiddleware_LongConnection
 
 # 释放路径并发交错（建议在竞态检测下反复运行）
-CGO_ENABLED=1 go test -race -count=10 ./quota/       -run TestRelease_
+CGO_ENABLED=1 go test -race -count=10 ./quota/       -run 'TestRelease_|TestReclaim_Concurrent'
 CGO_ENABLED=1 go test -race -count=10 ./middleware/  -run TestMiddleware_ConcurrentDisconnectStorm
+
+# 名额丢失补占 + 降级/抖动交错（竞态检测下重复跑）
+CGO_ENABLED=1 go test -race -count=5 ./quota/ -run 'TestLease_BackendRecordLoss|TestLease_ReclaimWaits|TestReclaim_DegradeFlapping'
 ```
 
 测试覆盖的关键场景：
@@ -46,6 +51,10 @@ CGO_ENABLED=1 go test -race -count=10 ./middleware/  -run TestMiddleware_Concurr
 | 释放路径任意并发交错不崩溃、不泄漏（竞态检测） | `quota.TestRelease_ConcurrentInterleavingsNoCrashNoLeak`、`quota.TestRelease_BackendFlakyNoCrashTTLBackstop`、`middleware.TestMiddleware_ConcurrentDisconnectStorm` |
 | 长连接正常/超时/客户端中断释放、重复与乱序释放 | `quota.TestAcquire_LongConnectionReleasePaths`、`middleware.TestMiddleware_LongConnectionReleasesOnClientInterrupt` |
 | 降级放行的本地硬上限、恢复后不放大不重复计数 | `quota.TestDegradeAllow_LocalHardCapEnforced`、`..._RecoveryNoAmplificationNoDoubleCount` |
+| 故障前已在途遇上放行仍不超上限、放行在途回收与恢复计账 | `quota.TestDegradeAllow_PreExistingInFlightPlusFailOpenNeverExceedsCap`、`..._DefaultCapIncludesPreExisting` |
+| 较长请求在途时后端记录中途丢失：自动补占、正常释放、上限满等待恢复 | `quota.TestLease_BackendRecordLossIsReclaimed`、`..._ReclaimedLeaseReleasesNormally`、`..._ReclaimWaitsWhenCapFullThenRecovers` |
+| 存储层丢失上报与按上限补占（内存 + 真实 Lua 路径） | `store.TestMemoryStore_RenewReportsMissingToken`、`..._ReclaimRefillsLostSlot`、`..._ReclaimRespectsCaps`、`store.TestRedisStore_RenewReclaimAfterBackendRecordLoss` |
+| 高并发释放/断连/超时/补占/降级抖动交错不崩不泄漏（竞态） | `quota.TestReclaim_ConcurrentInterleavings`、`..._DegradeFlappingNoExceedNoLeak` |
 | 长连接期间的热更新（不误回收/不重复占用、非法配置被拒） | `quota.TestHotUpdate_DuringLongConnection`、`..._RemoveRuleKeepsInFlightSafe` |
 | 排队客户端取消不留幽灵占位 | `quota.TestAcquire_ClientCancelWhileQueuedDoesNotLeak` |
 | 配置非法/不兼容被拒绝且保留旧配置 | `quota.TestUpdateConfig_InvalidKeepsOldConfig`、`quota.TestParseConfig_Invalid` |

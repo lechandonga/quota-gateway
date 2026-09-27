@@ -126,29 +126,82 @@ func (s *MemoryStore) Release(ctx context.Context, keys []string, token string) 
 
 // Renew 批量延长占位过期时间；仅刷新仍存活（未过期、未释放）的占位，
 // 已过期/不存在的 token 不复活，避免名额被重复计入。
-func (s *MemoryStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) error {
+//
+// 返回在 keys 中“并非每个键都仍持有”的 token：即任一占位键上已经
+// 丢失（过期/被删/从未存在）的 token，供调用方做丢失感知与补占。
+func (s *MemoryStore) Renew(ctx context.Context, keys []string, tokens []string, ttl time.Duration) ([]string, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	if ttl <= 0 {
-		return nil // 无 TTL 的占位不过期，无需续租
+		return nil, nil // 无 TTL 的占位不过期，无需续租
 	}
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, k := range keys {
-		holders := s.conc[k]
-		if holders == nil {
-			continue
-		}
-		s.expireLocked(holders, now)
-		for _, tok := range tokens {
+	var missing []string
+	for _, tok := range tokens {
+		lost := false
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			holders := s.conc[k]
+			if holders == nil {
+				lost = true
+				continue
+			}
+			s.expireLocked(holders, now)
 			if _, ok := holders[tok]; ok {
 				holders[tok] = now.Add(ttl)
+			} else {
+				lost = true
 			}
 		}
+		// 只要在某个应持有的键上不存在即上报（含全部键均已丢失）；
+		// 已正常 Release 的 token 也可能出现在这里，由调用方按本地
+		// 租约状态自行过滤。
+		if lost {
+			missing = append(missing, tok)
+		}
 	}
-	return nil
+	return missing, nil
+}
+
+// Reclaim 在不触碰速率令牌的前提下，按当前上限原子补占丢失的 token。
+// 租户键为空（MaxConcurrent<=0 的规则、仅受共享池约束）时只补占共享键；
+// 任一启用的键达到对应上限则整体不写入，返回受限状态供调用方稍后重试。
+func (s *MemoryStore) Reclaim(ctx context.Context, req ReclaimRequest) (Status, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var tenantHolders map[string]time.Time
+	if req.ConcKey != "" && req.MaxConcurrent > 0 {
+		tenantHolders = s.holdersLocked(req.ConcKey)
+		s.expireLocked(tenantHolders, now)
+		if int64(len(tenantHolders)) >= req.MaxConcurrent {
+			return StatusConcurrencyLimited, nil
+		}
+	}
+	var sharedHolders map[string]time.Time
+	if req.SharedKey != "" && req.MaxShared > 0 {
+		sharedHolders = s.holdersLocked(req.SharedKey)
+		s.expireLocked(sharedHolders, now)
+		if int64(len(sharedHolders)) >= req.MaxShared {
+			return StatusSharedLimited, nil
+		}
+	}
+	if tenantHolders != nil {
+		s.putLocked(tenantHolders, req.Token, now, req.TTL)
+	}
+	if sharedHolders != nil {
+		s.putLocked(sharedHolders, req.Token, now, req.TTL)
+	}
+	return StatusAcquired, nil
 }
 
 func (s *MemoryStore) Ping(ctx context.Context) error { return ctx.Err() }
@@ -229,3 +282,18 @@ func (s *MemoryStore) inflight(key string) int {
 
 // Inflight 返回某键当前有效占位数，供测试与运维观测使用。
 func (s *MemoryStore) Inflight(key string) int { return s.inflight(key) }
+
+// LoseHolders 删除 token 在所有占位键上的记录：测试用，模拟后端抖动/
+// 重启导致“在途请求仍在处理、后端名额记录中途丢失”。
+func (s *MemoryStore) LoseHolders(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, holders := range s.conc {
+		if _, ok := holders[token]; ok {
+			delete(holders, token)
+			if len(holders) == 0 {
+				delete(s.conc, k)
+			}
+		}
+	}
+}
