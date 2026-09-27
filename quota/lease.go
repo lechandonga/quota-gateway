@@ -154,11 +154,25 @@ func (m *Manager) renewLeases() {
 	sort.Strings(sortKeys)
 	for _, k := range sortKeys {
 		es := groups[k]
+		// 续租前按最新租约表过滤：快照之后已释放的 token 不再续租，
+		// 把“释放与续租交错导致占位被重建”的窗口压到最小（极端交错
+		// 下的残留也有界于一个 TTL，见 store.Store.Renew 契约）。
+		live := m.leases.snapshot()
+		liveSet := make(map[string]struct{}, len(live))
+		for _, e := range live {
+			liveSet[e.token] = struct{}{}
+		}
 		tokens := make([]string, 0, len(es))
 		byToken := make(map[string]*leaseEntry, len(es))
 		for _, e := range es {
+			if _, ok := liveSet[e.token]; !ok {
+				continue
+			}
 			tokens = append(tokens, e.token)
 			byToken[e.token] = e
+		}
+		if len(tokens) == 0 {
+			continue
 		}
 		// 单次续租的存储访问 capped：后端缓慢时后台循环仍能及时
 		// 回到回收职责，避免健康租约因续租被拖而误过期。

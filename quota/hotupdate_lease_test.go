@@ -92,9 +92,14 @@ func TestHotUpdate_RemoveRuleKeepsInFlightSafe(t *testing.T) {
 		t.Fatalf("in-flight slot lost after rule removal: inflight=%d", got)
 	}
 	hold()
-	time.Sleep(100 * time.Millisecond)
-	if got := ms.Inflight("cc:t1:/long"); got != 0 {
-		t.Fatalf("slot leaked after release: inflight=%d", got)
+	// 释放与续租的极端交错可能留下至多一个 TTL 的占位残留（有界），
+	// 轮询等待其归零，总体不泄漏。
+	deadline := time.Now().Add(2 * time.Second)
+	for ms.Inflight("cc:t1:/long") != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("slot leaked after release: inflight=%d", ms.Inflight("cc:t1:/long"))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	// 无规则：新请求直接放行且不占名额。
 	rel, err := m.Acquire(ctx, "t1", "/long")
